@@ -63,14 +63,18 @@ class ManoMesher:
             np.asarray(layer.faces, dtype=np.int64) for layer in self._layers
         ]
 
-    def posed_mesh(self, hand: Mapping[str, object], slot: int) -> HandMesh:
+    def posed_mesh(self, hand: Mapping[str, object], slot: int) -> HandMesh | None:
+        global_transform = hand.get("global_transform")
+        pose_parameters = hand.get("pose_parameters")
+        if global_transform is None or pose_parameters is None:
+            return None
         # global_transform is the root's axis-angle, then a translation in meters.
-        transform = torch.tensor([hand["global_transform"]], dtype=torch.float64)
+        transform = torch.tensor([global_transform], dtype=torch.float64)
         with torch.no_grad():
             output = self._layers[slot](
                 betas=self._betas,
                 global_orient=transform[:, :3],
-                hand_pose=torch.tensor([hand["pose_parameters"]], dtype=torch.float64),
+                hand_pose=torch.tensor([pose_parameters], dtype=torch.float64),
                 transl=transform[:, 3:],
             )
         vertices = output.vertices[0]

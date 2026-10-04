@@ -17,8 +17,8 @@ Frames are written as JPEG by default. The source videos are already lossy
 size; use ``--format png`` only if you need bit-exact decoded frames.
 
 By default every scene under ``--root`` is extracted. ``--manifest`` restricts the
-run to the scenes a JSONL manifest names, and ``--require-object-pose`` to the
-scenes with object-pose ground truth.
+run to the scenes a JSONL manifest names. Without it, ``--require-object-pose``
+keeps only the scenes with object-pose ground truth.
 
 Sampling keeps every k-th frame, so ``--fps`` must be a whole number that divides
 the 60 fps source: 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, or 60. It is required

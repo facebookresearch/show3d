@@ -7,7 +7,7 @@ a dataset of 3D hands and objects captured in the wild (CVPR 2026).
 [Dataset](https://huggingface.co/datasets/facebook/show3d-dataset) |
 [Interaction Field Estimation Challenge](https://github.com/patrickqrim/SHOW3D-dataset-api/tree/main/show3d/interaction_field)
 
-![A SHOW3D frame with the hand skeleton and object drawn on it](docs/overlay.png)
+![Both egocentric views of a SHOW3D frame with the hand skeletons and object drawn on them](docs/overlay.png)
 
 SHOW3D has 2,137 recordings of hands using objects in the wild, 20 hours in
 total. Each recording has two egocentric views from a Meta Quest 3 headset at 60
@@ -122,14 +122,17 @@ Pin the data and code revisions together to keep the same set of valid frames.
 
 ```bash
 python -m show3d.demo_viz --root /path/to/show3d --manifest frames.jsonl \
-    --mode overlay --out overlay.png
+    --mode overlay --view stereo --out overlay.png
 python -m show3d.demo_viz --root /path/to/show3d --manifest frames.jsonl \
     --mode geometry --out geometry.png
 ```
 
 It picks the first frame with a valid headset pose and a confident hand. The
-`overlay` mode projects the hand skeleton and object onto the egocentric image,
-as in the image at the top. The `geometry` mode draws them in 3D:
+`overlay` mode projects the hand skeletons and object onto one egocentric image
+(`--view headset0` or `headset1`), or onto both side by side with
+`--view stereo`, as in the image at the top. Left hands are orange and right
+hands cyan in every render, hand meshes included. The `geometry` mode draws them
+in 3D:
 
 ![The hand skeleton and object surface of a frame in 3D](docs/geometry.png)
 

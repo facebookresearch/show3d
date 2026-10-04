@@ -103,7 +103,12 @@ class MhrMesher:
             self._vertices.append(keep)
             self._faces.append(remap[all_faces[np.isin(all_faces, keep).all(1)]])
 
-    def posed_mesh(self, hand: Mapping[str, object], slot: int) -> HandMesh:
+    def posed_mesh(self, hand: Mapping[str, object], slot: int) -> HandMesh | None:
+        if any(
+            hand.get(key) is None
+            for key in ("finger_parameters", "wrist_rotation", "wrist_translation")
+        ):
+            return None
         vertices_cm, skeleton_state = self._posed(hand, slot)
         return HandMesh(
             vertices_world_mm=self._to_world_mm(

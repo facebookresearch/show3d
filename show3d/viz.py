@@ -8,7 +8,8 @@
 
 Two renders of one frame, each writing a PNG:
 
-* :func:`render_overlay`  -- hand skeleton + object projected onto the frame (2D).
+* :func:`render_overlay`  -- hand skeleton + object projected onto the frame (2D),
+  or onto both egocentric frames side by side.
 * :func:`render_geometry` -- hand skeleton + object surface in 3D.
 
 :func:`run_visualization` picks a suitable frame from a frame manifest and
@@ -88,17 +89,25 @@ HAND_EDGES: tuple[tuple[int, int], ...] = (
     (14, 17),  # palm arch
 )
 
-# (legend label, color) per hand, keyed by ``LEFT_HAND`` / ``RIGHT_HAND``.
-HAND_STYLES: dict[str, tuple[str, str]] = {
-    LEFT_HAND: ("left hand", "tab:blue"),
-    RIGHT_HAND: ("right hand", "tab:green"),
-}
-# Hand mesh RGB per slot, orange for the left hand and cyan for the right: the
-# colors of the released viz_*.mp4 videos.
+# Hand RGB per slot, orange for the left hand and cyan for the right: the colors
+# of the released viz_*.mp4 videos. Skeletons and meshes both use them.
 MESH_COLORS: tuple[tuple[int, int, int], tuple[int, int, int]] = (
     (235, 104, 52),
     (42, 184, 214),
 )
+
+
+def _hex_color(rgb: tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+# (legend label, color) per hand, keyed by ``LEFT_HAND`` / ``RIGHT_HAND``.
+HAND_STYLES: dict[str, tuple[str, str]] = {
+    LEFT_HAND: ("left hand", _hex_color(MESH_COLORS[LEFT_SLOT])),
+    RIGHT_HAND: ("right hand", _hex_color(MESH_COLORS[RIGHT_SLOT])),
+}
+# The ``view`` that overlays both egocentric views side by side.
+STEREO_VIEW: str = "stereo"
 # A vertex barely in front of the camera plane projects millions of pixels away.
 # Pulling it to this distance from the principal point along its own direction
 # keeps OpenCV's fixed-point coordinates in int32 and moves the triangle's edges
@@ -261,19 +270,25 @@ def frame_hands(frame_data: Show3DFrameData) -> dict[str, HandPoseFrame | None]:
     return {LEFT_HAND: frame_data.left_hand, RIGHT_HAND: frame_data.right_hand}
 
 
+def drawn_landmarks(hand: HandPoseFrame | None) -> FloatArray | None:
+    """The hand's landmarks to draw, or None when the hand is missing, has no
+    landmarks, or is at or below the accept gate that :mod:`show3d.hand_mesh`
+    also uses."""
+    if hand is None or hand.confidence <= ACCEPT_CONFIDENCE_THRESHOLD:
+        return None
+    return hand.landmarks_world_mm
+
+
 def present_hands(frame_data: Show3DFrameData) -> list[tuple[str, str, FloatArray]]:
-    """``(label, color, joints_world_mm)`` for each hand above the accept gate,
-    the hands that :mod:`show3d.hand_mesh` meshes."""
+    """``(label, color, joints_world_mm)`` for each hand with
+    :func:`drawn_landmarks`."""
     out: list[tuple[str, str, FloatArray]] = []
     for side, hand in frame_hands(frame_data).items():
-        if (
-            hand is None
-            or hand.landmarks_world_mm is None
-            or hand.confidence <= ACCEPT_CONFIDENCE_THRESHOLD
-        ):
+        joints = drawn_landmarks(hand)
+        if joints is None:
             continue
         label, color = HAND_STYLES[side]
-        out.append((label, color, hand.landmarks_world_mm))
+        out.append((label, color, joints))
     return out
 
 
@@ -322,20 +337,30 @@ def _decode_frame(video_path: Path, frame_index: int) -> FloatArray | None:
         capture.release()
 
 
-def render_overlay(
-    frame_data: Show3DFrameData, view_name: str, out_path: str | Path
-) -> None:
-    """Hand skeleton + object projected onto the egocentric frame (2D)."""
+def _overlay_view_names(view_name: str) -> tuple[str, ...]:
+    """The egocentric views an overlay of ``view_name`` draws: both for
+    ``STEREO_VIEW``, else just ``view_name``."""
+    return EGOCENTRIC_VIEWS if view_name == STEREO_VIEW else (view_name,)
+
+
+def _overlay_view(
+    frame_data: Show3DFrameData, view_name: str
+) -> tuple[Path, CameraCalibration]:
     view = frame_data.views.get(view_name)
     if view is None or view.calibration is None:
         raise ValueError(f"view {view_name!r} has no calibration to overlay")
-    calibration = view.calibration
-    if calibration.t_world_from_camera is None:
+    if view.calibration.t_world_from_camera is None:
         raise ValueError(f"view {view_name!r} has no valid t_world_from_camera")
+    return view.video_path, view.calibration
 
-    fig = Figure(figsize=(8, 8 * calibration.image_height / calibration.image_width))
-    ax: Any = fig.add_subplot()
-    image = _decode_frame(view.video_path, frame_data.frame.frame_index)
+
+def _draw_overlay(
+    ax: Any,
+    frame_data: Show3DFrameData,
+    video_path: Path,
+    calibration: CameraCalibration,
+) -> None:
+    image = _decode_frame(video_path, frame_data.frame.frame_index)
     if image is not None:
         ax.imshow(image)
     else:
@@ -354,8 +379,28 @@ def render_overlay(
     ax.set_ylim(calibration.image_height, 0)  # image row 0 at top
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_title(f"SHOW3D {view_name} overlay: {frame_data.frame.sample_id}")
-    ax.legend(loc="upper right", fontsize="small")
+
+
+def render_overlay(
+    frame_data: Show3DFrameData, view_name: str, out_path: str | Path
+) -> None:
+    """Hand skeleton + object projected onto the egocentric frame (2D). With
+    ``STEREO_VIEW``, onto both egocentric frames side by side."""
+    names = _overlay_view_names(view_name)
+    views = [_overlay_view(frame_data, name) for name in names]
+    first = views[0][1]
+    fig = Figure(
+        figsize=(8 * len(views), 8 * first.image_height / first.image_width),
+        layout="compressed",
+    )
+    axes: Any = fig.subplots(1, len(views), squeeze=False)[0]
+    sample_id = frame_data.frame.sample_id
+    for ax, name, (video_path, calibration) in zip(axes, names, views):
+        _draw_overlay(ax, frame_data, video_path, calibration)
+        ax.set_title(name if len(views) > 1 else f"SHOW3D {name} overlay: {sample_id}")
+    if len(views) > 1:
+        fig.suptitle(f"SHOW3D stereo overlay: {sample_id}")
+    axes[-1].legend(loc="upper right", fontsize="small")
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
 
 
@@ -368,6 +413,15 @@ def _has_confident_hand(frame_data: Show3DFrameData) -> bool:
         and hand.landmarks_world_mm is not None
         and hand.confidence > DEFAULT_CONFIDENCE_THRESHOLD
         for hand in frame_hands(frame_data).values()
+    )
+
+
+def _has_view_pose(frame_data: Show3DFrameData, view_name: str) -> bool:
+    view = frame_data.views.get(view_name)
+    return (
+        view is not None
+        and view.calibration is not None
+        and view.calibration.t_world_from_camera is not None
     )
 
 
@@ -388,7 +442,8 @@ def _pick_frame(
     dataset: Show3DDataset, mode: str, view_name: str
 ) -> Show3DFrameData | None:
     """The first frame with a valid headset pose and a confident hand; for
-    overlay, preferably one whose hand lands in the view."""
+    overlay, preferably one whose hand lands in every overlaid view."""
+    names = _overlay_view_names(view_name)
     fallback: Show3DFrameData | None = None
     for index in range(len(dataset)):
         frame_data = dataset[index]
@@ -396,14 +451,11 @@ def _pick_frame(
             continue
         if mode != "overlay":
             return frame_data
-        view = frame_data.views.get(view_name)
-        if view is None or view.calibration is None:
-            continue
-        if view.calibration.t_world_from_camera is None:
+        if not all(_has_view_pose(frame_data, name) for name in names):
             continue
         if fallback is None:
             fallback = frame_data
-        if _projects_into_view(frame_data, view_name):
+        if all(_projects_into_view(frame_data, name) for name in names):
             return frame_data
     return fallback
 
@@ -423,13 +475,12 @@ def run_visualization(
     dataset = Show3DDataset.from_manifest_jsonl(root, manifest_path)
     frame_data = _pick_frame(dataset, mode, view)
     if frame_data is None:
-        hand_pose = (
-            dataset.paths.hand_pose_path(dataset.frames[0]) if dataset.frames else None
-        )
+        if not dataset.frames:
+            raise ValueError(f"{manifest_path} lists no frames")
         raise ValueError(
             f"no frame in {manifest_path} has a valid headset pose and a hand above "
             f"confidence {DEFAULT_CONFIDENCE_THRESHOLD} (hand poses read from "
-            f"{hand_pose}, for example)"
+            f"{dataset.paths.hand_pose_path(dataset.frames[0])}, for example)"
         )
 
     out = Path(out_path)

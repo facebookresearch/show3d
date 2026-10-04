@@ -5,7 +5,9 @@ possible.
 
 ## Pull Requests
 
-We welcome pull requests.
+We welcome pull requests. This repository is exported from Meta's internal
+source tree, so maintainers apply an accepted pull request there first, and the
+next export brings it to GitHub.
 
 1. Fork the repo and create your branch from `main`.
 2. If you've added code that should be tested, add tests.

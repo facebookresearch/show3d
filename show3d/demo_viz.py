@@ -11,7 +11,8 @@
     python -m show3d.demo_viz --mode overlay --root DIR --manifest M.jsonl --out overlay.png
 
 With no --root/--manifest it renders a bundled synthetic scene. Modes: overlay
-(skeleton + object on the frame) and geometry (3D skeleton + object).
+(skeleton + object on the frame) and geometry (3D skeleton + object). With
+--view stereo, overlay draws headset0 and headset1 side by side.
 
 --model draws one hand model's posed meshes on a scene's frames instead, as an
 image, or with --video as an MP4 of --num-frames frames:
@@ -27,6 +28,7 @@ import tempfile
 from pathlib import Path
 
 from . import viz
+from .dataset import EGOCENTRIC_VIEWS
 from .hand_mesh import DEFAULT_MESH_HAND_POSE_VERSION, HAND_MODELS
 from .synthetic import build_synthetic_scene
 
@@ -46,8 +48,8 @@ def main() -> None:
     parser.add_argument(
         "--view",
         default="headset0",
-        choices=["headset0", "headset1"],
-        help="egocentric view for overlay mode and --model",
+        choices=[*EGOCENTRIC_VIEWS, viz.STEREO_VIEW],
+        help="egocentric view for overlay mode and --model (stereo: overlay only)",
     )
     parser.add_argument(
         "--model",
@@ -84,6 +86,8 @@ def main() -> None:
     if args.model is not None:
         if args.root is None or args.scene is None or args.scene.count("/") != 1:
             parser.error("--model needs --root and --scene SUBJECT/SCENE")
+        if args.view == viz.STEREO_VIEW:
+            parser.error("--model draws one view; pick headset0 or headset1")
         subject, scene = args.scene.split("/")
         default_out = Path(f"{args.model}.mp4" if args.video else f"{args.model}.png")
         viz.render_hand_meshes(
