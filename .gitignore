@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Extracted frames (large, regenerated locally)
+frames/
