@@ -4,10 +4,10 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Extract SHOW3D egocentric frames to a random-access image store, at a chosen fps.
+"""Extract SHOW3D camera frames to a random-access image store, at a chosen fps.
 
 Random per-frame seeking into the MP4s is slow, so training from video directly
-is decode-bound. This tool decodes each recording's headset video **once,
+is decode-bound. This tool decodes each recording's camera videos **once,
 sequentially** (no seeking), keeps the frames at your target fps, and writes them
 as images plus an ``index.jsonl`` that a fast, shuffle-friendly map-style dataset
 can read.
@@ -50,6 +50,7 @@ from pathlib import Path
 import cv2
 
 from .dataset import (
+    CAMERA_VIEWS,
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_OBJECT_POSE_VERSION,
     EGOCENTRIC_VIEWS,
@@ -212,7 +213,7 @@ def extract_scene(
     rows: list[dict[str, object]] = []
 
     for view in config.views:
-        video_path = paths.headset_path(frame_ref, int(view[-1]))
+        video_path = paths.video_path(frame_ref, view)
         if not video_path.exists():
             continue
         capture = cv2.VideoCapture(str(video_path))
@@ -379,7 +380,7 @@ def run_extraction(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract SHOW3D egocentric frames to images at a chosen fps"
+        description="Extract SHOW3D camera frames to images at a chosen fps"
     )
     parser.add_argument("--root", type=Path, required=True, help="SHOW3D mirror root")
     parser.add_argument("--out", type=Path, required=True, help="output directory")
@@ -401,8 +402,9 @@ def main() -> None:
         "--views",
         nargs="+",
         default=list(EGOCENTRIC_VIEWS),
-        choices=list(EGOCENTRIC_VIEWS),
-        help="egocentric views to extract",
+        choices=list(CAMERA_VIEWS),
+        help="cameras to extract: headset0 and headset1 (the default), or the "
+        "rig cameras rig0 ... rig7",
     )
     parser.add_argument(
         "--format",

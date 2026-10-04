@@ -33,11 +33,13 @@ from numpy.typing import NDArray
 from . import camera
 from .dataset import (
     ACCEPT_CONFIDENCE_THRESHOLD,
+    CAMERA_VIEWS,
     CameraCalibration,
     DEFAULT_CONFIDENCE_THRESHOLD,
     default_object_mesh_provider,
     DEFAULT_VIDEO_FPS,
     EGOCENTRIC_VIEWS,
+    EXOCENTRIC_VIEWS,
     FloatArray,
     HandPoseFrame,
     LEFT_HAND,
@@ -109,6 +111,8 @@ HAND_STYLES: dict[str, tuple[str, str]] = {
 }
 # The ``view`` that overlays both egocentric views side by side.
 STEREO_VIEW: str = "stereo"
+# The ``view`` that overlays every rig camera with a pose, in a grid.
+EXO_VIEW: str = "exo"
 # A vertex barely in front of the camera plane projects millions of pixels away.
 # Pulling it to this distance from the principal point along its own direction
 # keeps OpenCV's fixed-point coordinates in int32 and moves the triangle's edges
@@ -165,26 +169,41 @@ def set_equal_aspect_3d(ax: Any, points_mm: FloatArray) -> None:
     ax.set_box_aspect(tuple(float(s) if s > 0 else 1.0 for s in span))
 
 
-def draw_object_2d(ax: Any, object_uv: FloatArray, valid: NDArray[np.bool_]) -> None:
-    """Overlay projected object-surface points on an image axis."""
+def draw_object_2d(
+    ax: Any, object_uv: FloatArray, valid: NDArray[np.bool_], *, scale: float = 1.0
+) -> None:
+    """Overlay projected object-surface points on an image axis; ``scale``
+    shrinks the marks for small panels."""
     pts = object_uv[valid]
-    ax.scatter(pts[:, 0], pts[:, 1], s=2, c="gold", alpha=0.35, label="object")
+    ax.scatter(
+        pts[:, 0], pts[:, 1], s=2 * scale**2, c="gold", alpha=0.35, label="object"
+    )
 
 
 def draw_hand_skeleton_2d(
-    ax: Any, joints_uv: FloatArray, valid: NDArray[np.bool_], color: str, label: str
+    ax: Any,
+    joints_uv: FloatArray,
+    valid: NDArray[np.bool_],
+    color: str,
+    label: str,
+    *,
+    scale: float = 1.0,
+    joint_scale: float | None = None,
 ) -> None:
-    """Overlay the hand skeleton (bones + joints) on an image axis."""
+    """Overlay the hand skeleton (bones + joints) on an image axis; ``scale``
+    shrinks the lines for small panels, and ``joint_scale`` (default ``scale``)
+    the joint markers."""
     for a, b in HAND_EDGES:
         if valid[a] and valid[b]:
             ax.plot(
                 [joints_uv[a, 0], joints_uv[b, 0]],
                 [joints_uv[a, 1], joints_uv[b, 1]],
                 c=color,
-                linewidth=2.0,
+                linewidth=2.0 * scale,
             )
     shown = joints_uv[valid]
-    ax.scatter(shown[:, 0], shown[:, 1], s=18, c=color, label=label)
+    joint_scale = scale if joint_scale is None else joint_scale
+    ax.scatter(shown[:, 0], shown[:, 1], s=18 * joint_scale**2, c=color, label=label)
 
 
 def draw_hand_meshes(
@@ -391,9 +410,13 @@ def _decode_frame(video_path: Path, frame_index: int) -> FloatArray | None:
 
 
 def _overlay_view_names(view_name: str) -> tuple[str, ...]:
-    """The egocentric views an overlay of ``view_name`` draws: both for
-    ``STEREO_VIEW``, else just ``view_name``."""
-    return EGOCENTRIC_VIEWS if view_name == STEREO_VIEW else (view_name,)
+    """The cameras an overlay of ``view_name`` can draw: both headsets for
+    ``STEREO_VIEW``, the rig cameras for ``EXO_VIEW``, else just ``view_name``."""
+    if view_name == STEREO_VIEW:
+        return EGOCENTRIC_VIEWS
+    if view_name == EXO_VIEW:
+        return EXOCENTRIC_VIEWS
+    return (view_name,)
 
 
 def _overlay_view(
@@ -402,6 +425,8 @@ def _overlay_view(
     view = frame_data.views.get(view_name)
     if view is None or view.calibration is None:
         raise ValueError(f"view {view_name!r} has no calibration to overlay")
+    if view.missing:
+        raise ValueError(f"view {view_name!r} is missing on this frame")
     if view.calibration.t_world_from_camera is None:
         raise ValueError(f"view {view_name!r} has no valid t_world_from_camera")
     return view.video_path, view.calibration
@@ -412,6 +437,8 @@ def _draw_overlay(
     frame_data: Show3DFrameData,
     video_path: Path,
     calibration: CameraCalibration,
+    scale: float = 1.0,
+    joint_scale: float | None = None,
 ) -> None:
     image = _decode_frame(video_path, frame_data.frame.frame_index)
     if image is not None:
@@ -422,11 +449,13 @@ def _draw_overlay(
     surface = object_surface(frame_data)
     if surface is not None:
         object_uv, object_valid = camera.project_to_image(surface, calibration)
-        draw_object_2d(ax, object_uv, object_valid)
+        draw_object_2d(ax, object_uv, object_valid, scale=scale)
     for label, color, joints in present_hands(frame_data):
         joints_uv, valid = camera.project_to_image(joints, calibration)
         if bool(valid.any()):
-            draw_hand_skeleton_2d(ax, joints_uv, valid, color, label)
+            draw_hand_skeleton_2d(
+                ax, joints_uv, valid, color, label, scale=scale, joint_scale=joint_scale
+            )
 
     ax.set_xlim(0, calibration.image_width)
     ax.set_ylim(calibration.image_height, 0)  # image row 0 at top
@@ -437,29 +466,54 @@ def _draw_overlay(
 def render_overlay(
     frame_data: Show3DFrameData, view_name: str, out_path: str | Path
 ) -> None:
-    """Hand skeleton + object projected onto the egocentric frame (2D). With
-    ``STEREO_VIEW``, onto both egocentric frames side by side."""
+    """Hand skeleton + object projected onto one camera's frame (2D). With
+    ``STEREO_VIEW``, onto both egocentric frames side by side; with
+    ``EXO_VIEW``, onto every rig camera that has a pose, in a grid."""
     names = _overlay_view_names(view_name)
+    if view_name == EXO_VIEW:
+        names = tuple(name for name in names if _has_view_pose(frame_data, name))
+        if not names:
+            raise ValueError("no rig camera has a camera pose on this frame")
     views = [_overlay_view(frame_data, name) for name in names]
+    if not views:
+        raise ValueError(f"view {view_name!r} names no camera to overlay")
+    columns = min(len(views), 4)
+    rows = -(-len(views) // columns)
     first = views[0][1]
+    panel_inches = 8.0 if len(views) <= 2 else 4.5
+    scale = panel_inches / 8.0
+    # Hands are small in the rig cameras, so their joints shrink further.
+    joint_shrink = 0.5 if view_name == EXO_VIEW else 1.0
     fig = Figure(
-        figsize=(8 * len(views), 8 * first.image_height / first.image_width),
+        figsize=(
+            panel_inches * columns,
+            panel_inches * rows * first.image_height / first.image_width,
+        ),
         layout="compressed",
     )
-    axes: Any = fig.subplots(1, len(views), squeeze=False)[0]
+    axes: Any = fig.subplots(rows, columns, squeeze=False).ravel()
+    for ax in axes[len(views) :]:
+        ax.axis("off")
     sample_id = frame_data.frame.sample_id
+    grid = view_name in (STEREO_VIEW, EXO_VIEW)
     for ax, name, (video_path, calibration) in zip(axes, names, views):
-        _draw_overlay(ax, frame_data, video_path, calibration)
-        ax.set_title(name if len(views) > 1 else f"SHOW3D {name} overlay: {sample_id}")
-    if len(views) > 1:
-        fig.suptitle(f"SHOW3D stereo overlay: {sample_id}")
+        _draw_overlay(
+            ax, frame_data, video_path, calibration, scale, scale * joint_shrink
+        )
+        ax.set_title(name if grid else f"SHOW3D {name} overlay: {sample_id}")
+    if grid:
+        fig.suptitle(f"SHOW3D {view_name} overlay: {sample_id}")
     # One legend for all views, even when a hand shows in only one of them.
     handles: dict[str, Any] = {}
-    for ax in axes:
+    for ax in axes[: len(views)]:
         for handle, label in zip(*ax.get_legend_handles_labels()):
             handles.setdefault(label, handle)
-    axes[-1].legend(
-        list(handles.values()), list(handles), loc="upper right", fontsize="small"
+    axes[len(views) - 1].legend(
+        list(handles.values()),
+        list(handles),
+        loc="upper right",
+        fontsize="small",
+        markerscale=1.0 / (scale * joint_shrink),
     )
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
 
@@ -480,6 +534,7 @@ def _has_view_pose(frame_data: Show3DFrameData, view_name: str) -> bool:
     view = frame_data.views.get(view_name)
     return (
         view is not None
+        and not view.missing
         and view.calibration is not None
         and view.calibration.t_world_from_camera is not None
     )
@@ -501,8 +556,10 @@ def _projects_into_view(frame_data: Show3DFrameData, view_name: str) -> bool:
 def _pick_frame(
     dataset: Show3DDataset, mode: str, view_name: str
 ) -> Show3DFrameData | None:
-    """The first frame with a valid headset pose and a confident hand; for
-    overlay, preferably one whose hand lands in every overlaid view."""
+    """The first frame with a valid headset pose and a confident hand. For an
+    overlay, every overlaid view needs a camera pose (``EXO_VIEW``: at least one
+    rig camera), and a frame whose hand lands in every such view (``EXO_VIEW``:
+    in at least half of them) is preferred."""
     names = _overlay_view_names(view_name)
     fallback: Show3DFrameData | None = None
     for index in range(len(dataset)):
@@ -511,11 +568,18 @@ def _pick_frame(
             continue
         if mode != "overlay":
             return frame_data
-        if not all(_has_view_pose(frame_data, name) for name in names):
+        posed = [name for name in names if _has_view_pose(frame_data, name)]
+        if view_name == EXO_VIEW:
+            if not posed:
+                continue
+            wanted = (len(posed) + 1) // 2
+        elif len(posed) < len(names):
             continue
+        else:
+            wanted = len(names)
         if fallback is None:
             fallback = frame_data
-        if all(_projects_into_view(frame_data, name) for name in names):
+        if sum(_projects_into_view(frame_data, name) for name in posed) >= wanted:
             return frame_data
     return fallback
 
@@ -532,20 +596,27 @@ def run_visualization(
     """Pick a suitable frame from the manifest and render ``mode`` to ``out_path``."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
-    dataset = Show3DDataset.from_manifest_jsonl(root, manifest_path)
+    # Frame picking always needs headset0's frame-level pose.
+    views = tuple(
+        dict.fromkeys(
+            EGOCENTRIC_VIEWS[:1]
+            + (_overlay_view_names(view) if mode == "overlay" else ())
+        )
+    )
+    dataset = Show3DDataset.from_manifest_jsonl(root, manifest_path, views=views)
     frame_data = _pick_frame(dataset, mode, view)
     if frame_data is None:
         if not dataset.frames:
             raise ValueError(f"{manifest_path} lists no frames")
-        # Frame picking always needs headset0's frame-level pose.
-        views = dict.fromkeys(
-            EGOCENTRIC_VIEWS[:1]
-            + (_overlay_view_names(view) if mode == "overlay" else ())
+        needed = (
+            "headset0 and a rig camera"
+            if mode == "overlay" and view == EXO_VIEW
+            else " and ".join(views)
         )
         raise ValueError(
-            f"no frame in {manifest_path} has a camera pose in {' and '.join(views)} "
-            f"and a hand above confidence {DEFAULT_CONFIDENCE_THRESHOLD} (hand poses "
-            f"read from {dataset.paths.hand_pose_path(dataset.frames[0])}, for example)"
+            f"no frame in {manifest_path} has a camera pose in {needed} and a hand "
+            f"above confidence {DEFAULT_CONFIDENCE_THRESHOLD} (hand poses read from "
+            f"{dataset.paths.hand_pose_path(dataset.frames[0])}, for example)"
         )
 
     out = Path(out_path)
@@ -669,13 +740,17 @@ def render_hand_meshes(
     """
     if num_frames is not None and num_frames < 1:
         raise ValueError(f"num_frames must be at least 1, got {num_frames}")
+    if view not in CAMERA_VIEWS:
+        raise ValueError(
+            f"hand meshes draw on one camera of {CAMERA_VIEWS}, got {view!r}"
+        )
     meshes = HandMeshScene(
         root, subject, scene, model, asset_dir=asset_dir, version=hand_pose_version
     )
     start = _start_frame(meshes, frame_index)
     paths = Show3DPaths(root)
     frame = Show3DFrameRef(subject_id=subject, scene_id=scene, frame_index=start)
-    video_path = paths.headset_path(frame, EGOCENTRIC_VIEWS.index(view))
+    video_path = paths.video_path(frame, view)
     out = Path(out_path)
     written = _write_frames(
         meshes,

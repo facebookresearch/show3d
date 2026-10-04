@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import math
 import struct
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast, Literal
@@ -34,6 +34,7 @@ CalibrationPoseSource = Literal[
     "smooth_mocap_interpolation",
     "legacy_interpolation",
     "legacy_unspecified",
+    "static",
 ]
 
 DEFAULT_VIDEO_FPS: float = 60.0
@@ -47,6 +48,18 @@ DEFAULT_HAND_POSE_VERSION: str = "v2"
 LEGACY_HAND_POSE_VERSIONS: frozenset[str] = frozenset({"v1", "v2"})
 DEFAULT_OBJECT_POSE_VERSION: str = "v1"
 EGOCENTRIC_VIEWS: tuple[str, str] = ("headset0", "headset1")
+# The eight cameras of the back-mounted rig; a scene can lack some of them.
+EXOCENTRIC_VIEWS: tuple[str, ...] = (
+    "rig0",
+    "rig1",
+    "rig2",
+    "rig3",
+    "rig4",
+    "rig5",
+    "rig6",
+    "rig7",
+)
+CAMERA_VIEWS: tuple[str, ...] = EGOCENTRIC_VIEWS + EXOCENTRIC_VIEWS
 POSE_CONTRACT_VERSION: int = 1
 RIGID_TRANSFORM_TOLERANCE: float = 1e-4
 
@@ -161,7 +174,9 @@ class CameraCalibration:
 
     ``t_world_from_camera`` is ``None`` when this camera's transform is missing
     or the frame-level headset pose is invalid. ``is_synthesized`` retains its
-    legacy meaning; ``is_pose_valid`` is the version 1 headset-pose verdict.
+    legacy meaning; ``is_pose_valid`` is the version 1 headset-pose verdict. A
+    rig camera has one static transform, valid on every frame
+    (``pose_source == "static"``).
     """
 
     fx: float
@@ -179,17 +194,20 @@ class CameraCalibration:
 
 @dataclass(frozen=True)
 class ViewFrame:
-    """One egocentric view for a frame.
+    """One camera view for a frame.
 
     ``video_path`` is always set. ``image`` is the decoded RGB frame
     ``(H, W, 3)`` uint8 when the dataset is built with ``decode_images=True``,
     else ``None``. ``calibration`` is the parsed pinhole calibration.
+    ``missing`` is True when ``metadata/frame_info.json`` lists this camera in
+    the frame's ``missing_cameras``.
     """
 
     name: str
     video_path: Path
     image: NDArray[np.uint8] | None
     calibration: CameraCalibration | None
+    missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -238,10 +256,15 @@ class Show3DPaths:
     def scene_dir(self, frame: Show3DFrameRef) -> Path:
         return self.root / "scenes" / frame.subject_id / frame.scene_id
 
+    def video_path(self, frame: Show3DFrameRef, view: str) -> Path:
+        if view not in CAMERA_VIEWS:
+            raise ValueError(f"unknown view {view!r}; SHOW3D views are {CAMERA_VIEWS}")
+        return self.scene_dir(frame) / f"{view}.mp4"
+
     def headset_path(self, frame: Show3DFrameRef, camera_index: int) -> Path:
         if camera_index not in (0, 1):
-            raise ValueError("SHOW3D public API exposes headset0/headset1 only")
-        return self.scene_dir(frame) / f"headset{camera_index}.mp4"
+            raise ValueError("headset camera_index must be 0 or 1")
+        return self.video_path(frame, EGOCENTRIC_VIEWS[camera_index])
 
     def frame_info_path(self, frame: Show3DFrameRef) -> Path:
         return self.scene_dir(frame) / "metadata" / "frame_info.json"
@@ -293,6 +316,7 @@ class Show3DDataset:
         object_pose_version: str = DEFAULT_OBJECT_POSE_VERSION,
         load_poses: bool = True,
         multiview: bool = True,
+        views: Sequence[str] | None = None,
         decode_images: bool = False,
     ) -> None:
         self.paths: Show3DPaths = Show3DPaths(
@@ -302,15 +326,22 @@ class Show3DDataset:
         )
         self.frames: list[Show3DFrameRef] = list(frames)
         self.load_poses: bool = load_poses
-        # Multi-view exposes both headsets; single-view exposes headset0 only.
-        self.views: tuple[str, ...] = (
-            EGOCENTRIC_VIEWS if multiview else EGOCENTRIC_VIEWS[:1]
-        )
+        # ``views`` picks any cameras; without it, multi-view exposes both
+        # headsets and single-view headset0 only.
+        if views is None:
+            views = EGOCENTRIC_VIEWS if multiview else EGOCENTRIC_VIEWS[:1]
+        unknown = [view for view in views if view not in CAMERA_VIEWS]
+        if unknown:
+            raise ValueError(
+                f"unknown views {unknown}; SHOW3D views are {CAMERA_VIEWS}"
+            )
+        self.views: tuple[str, ...] = tuple(views)
         # Decode the frame pixels (needs opencv) vs return only the video path.
         self.decode_images: bool = decode_images
         self._object_pose_cache: dict[Path, Mapping[str, object]] = {}
         self._hand_pose_cache: dict[Path, Mapping[str, object]] = {}
         self._calibration_cache: dict[Path, Mapping[str, object]] = {}
+        self._missing_cameras_cache: dict[Path, dict[int, frozenset[str]]] = {}
 
     @classmethod
     def from_manifest_jsonl(
@@ -322,6 +353,7 @@ class Show3DDataset:
         object_pose_version: str = DEFAULT_OBJECT_POSE_VERSION,
         load_poses: bool = True,
         multiview: bool = True,
+        views: Sequence[str] | None = None,
         decode_images: bool = False,
     ) -> "Show3DDataset":
         return cls(
@@ -331,6 +363,7 @@ class Show3DDataset:
             object_pose_version=object_pose_version,
             load_poses=load_poses,
             multiview=multiview,
+            views=views,
             decode_images=decode_images,
         )
 
@@ -359,9 +392,14 @@ class Show3DDataset:
             )
             left_hand = hand_poses.get(LEFT_HAND)
             right_hand = hand_poses.get(RIGHT_HAND)
+        missing = load_missing_cameras(
+            self.paths.frame_info_path(frame),
+            frame.frame_index,
+            cache=self._missing_cameras_cache,
+        )
         views: dict[str, ViewFrame] = {}
         for name in self.views:
-            video_path = self.paths.headset_path(frame, int(name[-1]))
+            video_path = self.paths.video_path(frame, name)
             views[name] = ViewFrame(
                 name=name,
                 video_path=video_path,
@@ -375,6 +413,7 @@ class Show3DDataset:
                     frame.frame_index,
                     cache=self._calibration_cache,
                 ),
+                missing=name in missing,
             )
         headset_tracking_valid = not any(
             view.calibration is not None and view.calibration.is_synthesized
@@ -570,7 +609,11 @@ def load_camera_calibration(
     pose_source: CalibrationPoseSource = "legacy_unspecified"
     is_pose_valid = False
     by_index = data.get("T_WorldFromCamera_by_index")
-    if isinstance(by_index, dict):
+    static = data.get("T_WorldFromCamera")
+    if static is not None and by_index is None:
+        t_world_from_camera = _rigid_transform_from_json(static)
+        pose_source, is_pose_valid = "static", True
+    elif isinstance(by_index, dict):
         raw_entry = by_index.get(str(frame_index))
         if isinstance(raw_entry, dict):
             entry = cast(dict[str, object], raw_entry)
@@ -612,6 +655,32 @@ def load_camera_calibration(
         is_pose_valid=is_pose_valid,
         pose_contract_version=pose_contract_version,
     )
+
+
+def load_missing_cameras(
+    path: str | Path,
+    frame_index: int,
+    *,
+    cache: dict[Path, dict[int, frozenset[str]]] | None = None,
+) -> frozenset[str]:
+    """The cameras that ``metadata/frame_info.json`` lists as missing on this
+    frame; empty when the file or the frame is absent."""
+    info_path = Path(path)
+    if cache is not None and info_path in cache:
+        return cache[info_path].get(frame_index, frozenset())
+    by_frame: dict[int, frozenset[str]] = {}
+    if info_path.exists():
+        with info_path.open() as f:
+            rows = json.load(f)
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or "missing_cameras" not in row:
+                continue
+            entry = cast(dict[str, object], row)
+            cameras = cast(list[str] | None, entry["missing_cameras"]) or []
+            by_frame[_required_int(entry, "index")] = frozenset(cameras)
+    if cache is not None:
+        cache[info_path] = by_frame
+    return by_frame.get(frame_index, frozenset())
 
 
 def seek_frame(capture: cv2.VideoCapture, frame_index: int) -> bool:

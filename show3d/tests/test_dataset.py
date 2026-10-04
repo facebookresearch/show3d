@@ -13,6 +13,7 @@ import numpy as np
 
 from ..dataset import (
     DEFAULT_VIDEO_FPS,
+    load_camera_calibration,
     ObjectPoseFrame,
     sampled_frame_indices,
     Show3DDataset,
@@ -76,6 +77,37 @@ class Show3DDatasetTest(unittest.TestCase):
             np.testing.assert_allclose(item.object_pose.translation_mm, np.zeros(3))
             self.assertEqual(item.left_hand.confidence, 0.95)
             self.assertEqual(item.right_hand.confidence, 0.0)
+
+    def test_rig_calibration_has_a_static_pose_on_every_frame(self) -> None:
+        transform = [
+            [0.0, -1.0, 0.0, 10.0],
+            [1.0, 0.0, 0.0, 20.0],
+            [0.0, 0.0, 1.0, 30.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "rig0.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "ImageSizeX": 1280,
+                        "ImageSizeY": 1024,
+                        "fx": 450.0,
+                        "fy": 450.0,
+                        "cx": 640.0,
+                        "cy": 512.0,
+                        "DistortionModel": "PinholePlane",
+                        "T_WorldFromCamera": transform,
+                        "inverse": {},
+                    }
+                )
+            )
+            for frame_index in (0, 1234):
+                calibration = load_camera_calibration(path, frame_index)
+                assert calibration is not None
+                np.testing.assert_allclose(calibration.t_world_from_camera, transform)
+                self.assertTrue(calibration.is_pose_valid)
+                self.assertEqual(calibration.pose_source, "static")
 
     def test_pose_vertices_applies_world_from_object_transform(self) -> None:
         # 90deg about +z (world-from-object) then translate by (100, 0, 0) mm.

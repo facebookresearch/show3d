@@ -23,8 +23,8 @@ With this package you can:
 - pose and draw hand meshes in three hand models: UmeTrack, MANO and MHR
 - extract frames to images for fast training
 
-The package covers the two egocentric views. The dataset card describes the
-exocentric views, captions and depth.
+The package covers all ten cameras: the two headset cameras and the eight rig
+cameras. The dataset card describes the captions.
 
 ## Install
 
@@ -56,7 +56,9 @@ The code expects the released layout under one root folder:
 <root>/
 ├── scenes/<subject>/<scene>/
 │   ├── headset0.mp4, headset1.mp4              # egocentric videos
+│   ├── rig0.mp4 ... rig7.mp4                   # exocentric videos
 │   ├── camera_calibration/headset{0,1}.json   # intrinsics + per-frame pose
+│   ├── camera_calibration/rig{0..7}.json      # intrinsics + one static pose
 │   └── metadata/frame_info.json
 ├── object_pose/<version>/scenes/<subject>/<scene>/object_pose.json
 └── hand_pose/
@@ -88,6 +90,13 @@ frame.left_hand           # confidence and (21, 3) landmarks_world_mm, or None
 frame.object_pose         # confidence, rotation and translation_mm, or None
 frame.views["headset0"]   # video_path and calibration (intrinsics, world-from-camera)
 ```
+
+The dataset loads the two headset cameras by default. Pass
+`views=CAMERA_VIEWS` (from `show3d.dataset`) for all ten cameras, or
+`views=EXOCENTRIC_VIEWS` for the eight rig cameras `rig0` to `rig7`. A rig camera
+has one fixed pose in the rig frame, so it is valid on every frame. A scene can
+lack some rig cameras, and `frame.views[name].missing` is true when
+`metadata/frame_info.json` lists that camera as missing on the frame.
 
 Positions are in millimeters, in the world frame of the scene's calibration. This
 world frame is the frame of the back-mounted rig, so it moves with the person. See
@@ -124,16 +133,22 @@ Pin the data and code revisions together to keep the same set of valid frames.
 python -m show3d.demo_viz --root /path/to/show3d --manifest frames.jsonl \
     --mode overlay --view stereo --out overlay.png
 python -m show3d.demo_viz --root /path/to/show3d --manifest frames.jsonl \
+    --mode overlay --view exo --out exo.png
+python -m show3d.demo_viz --root /path/to/show3d --manifest frames.jsonl \
     --mode geometry --out geometry.png
 ```
 
 It picks the first frame with a camera pose in every view it draws and a
 confident hand. The `overlay` mode projects the hand skeletons and object onto
-one egocentric image (`--view headset0` or `headset1`), or onto both side by
-side with `--view stereo`, as in the image at the top. Left hands are orange and
-right hands cyan in every render, hand meshes included. The `geometry` mode
-draws them in 3D, in the headset0 camera's frame and seen from near that camera,
-so it lines up with the image:
+one camera's image (`--view headset0`, `headset1` or `rig0` to `rig7`), onto
+both headset images side by side with `--view stereo`, as in the image at the
+top, or onto every rig camera with a pose with `--view exo`:
+
+![The eight rig views of the same frame, with the hand skeletons and the vase drawn on them](docs/exo.png)
+
+Left hands are orange and right hands cyan in every render, hand meshes
+included. The `geometry` mode draws them in 3D, in the headset0 camera's frame
+and seen from near that camera, so it lines up with the headset image:
 
 ![The hand skeletons and the vase of the same frame in 3D](docs/geometry.png)
 
@@ -144,8 +159,9 @@ The drawing functions live in `show3d.viz` and the camera projection in
 
 From hand_pose v3 on, every hand-frame with world geometry comes in three hand
 models: UmeTrack (the native solve), MANO and MHR. `show3d.hand_mesh` poses each
-of them in the scene's world frame, and `demo_viz --model` draws the meshes on a
-headset frame, or on a frame range with `--video`:
+of them in the scene's world frame, and `demo_viz --model` draws the meshes on
+one camera's frame (`--view`, headset0 by default), or on a frame range with
+`--video`:
 
 ```bash
 python -m show3d.demo_viz --root /path/to/show3d --scene ISH822/aria_inspecting_3ab0 \
@@ -205,10 +221,12 @@ python -m show3d.extract_images --root /path/to/show3d --out frames/ --fps 10
   `--require-object-pose` keeps only the scenes with object poses.
   `--posed-only` also drops frames without a confident object pose.
 - `--views headset0`, `--format png`, `--quality 80` and `--workers 16` set the
-  views, image format, JPEG quality and parallelism.
+  cameras, image format, JPEG quality and parallelism. `--views` takes any of
+  the ten cameras, for example `--views rig0 rig1`; the default is the two
+  headsets.
 
 The output has one image per frame and view, plus `index.jsonl` with one row per
-image. Each row's `sample_id` (`SUBJECT/SCENE:FRAME`) is the same for both views
+image. Each row's `sample_id` (`SUBJECT/SCENE:FRAME`) is the same for every view
 of a frame, so you can join per-frame labels to the images on it.
 
 ## Interaction Field Estimation Challenge
