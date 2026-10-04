@@ -614,13 +614,29 @@ def load_camera_calibration(
     )
 
 
+def seek_frame(capture: cv2.VideoCapture, frame_index: int) -> bool:
+    """Position ``capture`` so its next read returns frame ``frame_index``;
+    return False when the video ends first.
+
+    A video backend may land a seek on an earlier keyframe; when the reported
+    position differs from the request, this decodes forward from the first frame.
+    """
+    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+    if int(capture.get(cv2.CAP_PROP_POS_FRAMES)) == frame_index:
+        return True
+    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    return all(capture.grab() for _ in range(frame_index))
+
+
 def _decode_frame(video_path: Path, frame_index: int) -> NDArray[np.uint8]:
     capture = cv2.VideoCapture(str(video_path))
     try:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        error = f"Could not read frame {frame_index} from {video_path}"
+        if not seek_frame(capture, frame_index):
+            raise ValueError(error)
         ok, frame_bgr = capture.read()
         if not ok:
-            raise ValueError(f"Could not read frame {frame_index} from {video_path}")
+            raise ValueError(error)
         return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     finally:
         capture.release()

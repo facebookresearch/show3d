@@ -3,7 +3,7 @@
 numpy
 opencv-python
 # Only needed for visualization (show3d.viz, python -m show3d.demo_viz):
-matplotlib
+matplotlib>=3.6
 # Only needed for hand meshes (show3d.hand_mesh, demo_viz --model). Install the
 # packages of each hand model you render; pymomentum-cpu needs Python 3.12 or 3.13.
 #   umetrack: pip install torch projectaria-tools

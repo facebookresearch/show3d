@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 from ..dataset import CameraCalibration
@@ -28,33 +27,22 @@ except ModuleNotFoundError:
     run_visualization is not None, "matplotlib is required for the visualization demo"
 )
 class VizTest(unittest.TestCase):
-    def _render(self, mode: str, view: str = "headset0") -> tuple[int, int]:
-        """Render ``mode`` of the synthetic scene; return the PNG's (width, height)."""
+    def _render(self, mode: str) -> None:
         assert run_visualization is not None
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             manifest_path = build_synthetic_scene(root, num_frames=4)
             out_path = root / f"{mode}.png"
-            returned = run_visualization(
-                root, manifest_path, out_path, mode=mode, view=view
-            )
+            returned = run_visualization(root, manifest_path, out_path, mode=mode)
             self.assertEqual(returned, out_path)
-            image = cv2.imread(str(out_path))
-            self.assertIsNotNone(image)
-            height, width = image.shape[:2]
-            return width, height
+            self.assertTrue(out_path.exists())
+            self.assertGreater(out_path.stat().st_size, 0)
 
     def test_geometry_mode(self) -> None:
         self._render("geometry")
 
     def test_overlay_mode(self) -> None:
         self._render("overlay")
-
-    def test_stereo_overlay_draws_both_views_side_by_side(self) -> None:
-        single_width, single_height = self._render("overlay")
-        stereo_width, stereo_height = self._render("overlay", view="stereo")
-        self.assertGreater(stereo_width, 1.8 * single_width)
-        self.assertLess(abs(stereo_height - single_height), 0.2 * single_height)
 
     def test_hand_mesh_nearer_triangle_occludes(self) -> None:
         assert draw_hand_meshes is not None

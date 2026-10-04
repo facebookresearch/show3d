@@ -44,6 +44,7 @@ from .dataset import (
     load_camera_calibration,
     object_alias_from_scene_id,
     RIGHT_HAND,
+    seek_frame,
     Show3DDataset,
     Show3DFrameData,
     Show3DFrameRef,
@@ -113,6 +114,9 @@ STEREO_VIEW: str = "stereo"
 # keeps OpenCV's fixed-point coordinates in int32 and moves the triangle's edges
 # by only a few pixels inside the image.
 _MAX_PIXEL: float = 1e5
+# (elev, azim) of the geometry render in camera axes: a little above and to the
+# right of the headset camera, which looks along +y.
+EGO_VIEW: tuple[float, float] = (12.0, -78.0)
 _SUBPIXEL_BITS: int = 4
 
 
@@ -193,7 +197,8 @@ def draw_hand_meshes(
     """Draw ``(mesh, rgb)`` pairs on a copy of the frame as shaded triangles.
 
     Triangles of all meshes are painted together from far to near, so a hand
-    occludes the other. A triangle with a vertex behind the camera is skipped.
+    occludes the other. A triangle with a vertex behind the camera, or with a
+    vertex that projects to a non-finite pixel, is skipped.
     """
     t_world_from_camera = calibration.t_world_from_camera
     if t_world_from_camera is None:
@@ -209,6 +214,8 @@ def draw_hand_meshes(
         triangles = triangles[front]
         uv, _valid = camera.project_to_image(mesh.vertices_world_mm, calibration)
         uv = uv[mesh.faces[front]]
+        finite = np.isfinite(uv).all(axis=(1, 2))
+        triangles, uv = triangles[finite], uv[finite]
         center = np.array([calibration.cx, calibration.cy])
         offset = uv - center
         distance = np.linalg.norm(offset, axis=-1, keepdims=True)
@@ -292,34 +299,79 @@ def present_hands(frame_data: Show3DFrameData) -> list[tuple[str, str, FloatArra
     return out
 
 
-def finish_3d(ax: Any, extent: list[FloatArray], title: str) -> None:
-    """Fit the 3D box to ``extent``, set the view, title, axis labels, legend."""
+def finish_3d(
+    ax: Any,
+    extent: list[FloatArray],
+    title: str,
+    *,
+    view: tuple[float, float] = (18.0, -70.0),
+    axis_labels: tuple[str, str, str] = ("x (mm)", "y (mm)", "z (mm)"),
+) -> None:
+    """Fit the 3D box to ``extent``; set the ``(elev, azim)`` view, title, axis
+    labels, legend."""
     if extent:
         set_equal_aspect_3d(ax, np.concatenate(extent, axis=0))
-    ax.view_init(elev=18, azim=-70)
+    ax.view_init(elev=view[0], azim=view[1])
     ax.set_title(title)
-    ax.set_xlabel("x (mm)")
-    ax.set_ylabel("y (mm)")
-    ax.set_zlabel("z (mm)")
+    ax.set_xlabel(axis_labels[0])
+    ax.set_ylabel(axis_labels[1])
+    ax.set_zlabel(axis_labels[2])
     ax.legend(loc="upper right", fontsize="small")
+
+
+def to_ego_axes(
+    points_world_mm: FloatArray, t_world_from_camera: FloatArray
+) -> FloatArray:
+    """World points in a camera's frame as ``(right, forward, up)``, the x, y and
+    z axes of a matplotlib 3D plot."""
+    points = camera.world_to_camera(points_world_mm, t_world_from_camera)
+    return np.stack([points[:, 0], points[:, 2], -points[:, 1]], axis=1)
+
+
+def _ego_or_world(
+    points_world_mm: FloatArray, t_world_from_camera: FloatArray | None
+) -> FloatArray:
+    if t_world_from_camera is None:
+        return points_world_mm
+    return to_ego_axes(points_world_mm, t_world_from_camera)
 
 
 # ----------------------------------------------------------------------------
 # renders
 # ----------------------------------------------------------------------------
 def render_geometry(frame_data: Show3DFrameData, out_path: str | Path) -> None:
-    """3D hand skeleton + object surface."""
+    """3D hand skeleton + object surface in the headset0 camera's frame, seen from
+    near that camera so the render lines up with the egocentric image. Without a
+    headset0 camera pose, it falls back to the world frame."""
+    view = frame_data.views.get(EGOCENTRIC_VIEWS[0])
+    t_world_from_camera = (
+        view.calibration.t_world_from_camera
+        if view is not None and view.calibration is not None
+        else None
+    )
     fig = Figure(figsize=(9, 7))
     ax = fig.add_subplot(projection="3d")
     extent: list[FloatArray] = []
     surface = object_surface(frame_data)
     if surface is not None:
+        surface = _ego_or_world(surface, t_world_from_camera)
         draw_object_3d(ax, surface)
         extent.append(surface)
     for label, color, joints in present_hands(frame_data):
+        joints = _ego_or_world(joints, t_world_from_camera)
         draw_hand_skeleton_3d(ax, joints, color, label)
         extent.append(joints)
-    finish_3d(ax, extent, f"SHOW3D hand + object: {frame_data.frame.sample_id}")
+    title = f"SHOW3D hand + object: {frame_data.frame.sample_id}"
+    if t_world_from_camera is None:
+        finish_3d(ax, extent, title)
+    else:
+        finish_3d(
+            ax,
+            extent,
+            title,
+            view=EGO_VIEW,
+            axis_labels=("right (mm)", "forward (mm)", "up (mm)"),
+        )
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
 
 
@@ -328,7 +380,8 @@ def _decode_frame(video_path: Path, frame_index: int) -> FloatArray | None:
         return None
     capture = cv2.VideoCapture(str(video_path))
     try:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        if not seek_frame(capture, frame_index):
+            return None
         ok, frame = capture.read()
         if not ok:
             return None
@@ -400,7 +453,14 @@ def render_overlay(
         ax.set_title(name if len(views) > 1 else f"SHOW3D {name} overlay: {sample_id}")
     if len(views) > 1:
         fig.suptitle(f"SHOW3D stereo overlay: {sample_id}")
-    axes[-1].legend(loc="upper right", fontsize="small")
+    # One legend for all views, even when a hand shows in only one of them.
+    handles: dict[str, Any] = {}
+    for ax in axes:
+        for handle, label in zip(*ax.get_legend_handles_labels()):
+            handles.setdefault(label, handle)
+    axes[-1].legend(
+        list(handles.values()), list(handles), loc="upper right", fontsize="small"
+    )
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
 
 
@@ -477,10 +537,15 @@ def run_visualization(
     if frame_data is None:
         if not dataset.frames:
             raise ValueError(f"{manifest_path} lists no frames")
+        # Frame picking always needs headset0's frame-level pose.
+        views = dict.fromkeys(
+            EGOCENTRIC_VIEWS[:1]
+            + (_overlay_view_names(view) if mode == "overlay" else ())
+        )
         raise ValueError(
-            f"no frame in {manifest_path} has a valid headset pose and a hand above "
-            f"confidence {DEFAULT_CONFIDENCE_THRESHOLD} (hand poses read from "
-            f"{dataset.paths.hand_pose_path(dataset.frames[0])}, for example)"
+            f"no frame in {manifest_path} has a camera pose in {' and '.join(views)} "
+            f"and a hand above confidence {DEFAULT_CONFIDENCE_THRESHOLD} (hand poses "
+            f"read from {dataset.paths.hand_pose_path(dataset.frames[0])}, for example)"
         )
 
     out = Path(out_path)
@@ -557,7 +622,8 @@ def _write_frames(
     writer: cv2.VideoWriter | None = None
     written = 0
     try:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        if not seek_frame(capture, frame_index):
+            return 0
         for index in range(frame_index, frame_index + (num_frames or 1)):
             ok, frame_bgr = capture.read()
             if not ok:
