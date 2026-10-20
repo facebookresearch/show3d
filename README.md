@@ -14,7 +14,12 @@ fps, and up to eight exocentric views from a camera rig worn on the back. The
 training scenes come with marker-less 3D hand poses, and a subset of them with
 object poses too; `object_pose/v2/index.parquet` lists them. From hand_pose v3
 on, the test scenes come with hand poses too, and from object_pose v2 on, a
-subset of them with object poses.
+subset of them with object poses. Interaction field v1 labels give, on each
+labeled frame, the vector from each hand landmark to the nearest vertex of the
+object mesh; `interaction_field/README.md` in the dataset describes them.
+These labels differ from those of the Interaction Field Estimation Challenge at
+ECCV 2026: v1 comes from hand pose v3 and object pose v2, points to the nearest
+mesh vertex, and covers every labeled frame of both splits.
 
 With this package you can:
 
@@ -64,10 +69,13 @@ The code expects the released layout under one root folder:
 ├── object_pose/
 │   ├── <version>/scenes/<subject>/<scene>/object_pose.json
 │   └── <version>/test_scenes/<subject>/<scene>/  # v2 on: the test split, same file
-└── hand_pose/
-    ├── <version>/scenes/<subject>/<scene>/hand_pose_umetrack.json   # v1, v2: hand_pose.json
-    ├── <version>/test_scenes/<subject>/<scene>/  # v3 on: the test split, same files
-    └── hand_profiles/<subject>/profile_umetrack.json
+├── hand_pose/
+│   ├── <version>/scenes/<subject>/<scene>/hand_pose_umetrack.json   # v1, v2: hand_pose.json
+│   ├── <version>/test_scenes/<subject>/<scene>/  # v3 on: the test split, same files
+│   └── hand_profiles/<subject>/profile_umetrack.json
+└── interaction_field/
+    ├── v1/scenes/<subject>/<scene>/interaction_field.jsonl
+    └── v1/test_scenes/<subject>/<scene>/interaction_field.jsonl  # the test split
 ```
 
 From hand_pose v3 on, each scene also has `hand_pose_mano.json` and

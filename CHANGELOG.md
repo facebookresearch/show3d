@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 2026-10-19
 
+- The README's data layout lists `interaction_field/v1`, the hand-to-object
+  vectors released on Hugging Face on October 19, 2026. They differ from the
+  labels of the ECCV 2026 Interaction Field Estimation Challenge.
 - object_pose v2 is the default: `DEFAULT_OBJECT_POSE_VERSION` is `"v2"`, so
   the loader, `posed_frames`, `extract_images` and `demo_viz` read
   `object_pose/v2/` unless given another version. Pass
