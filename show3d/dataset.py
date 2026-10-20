@@ -16,14 +16,14 @@ from __future__ import annotations
 import json
 import math
 import struct
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Container, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast, Literal
 
 import cv2
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import DTypeLike, NDArray
 
 
 FloatArray = NDArray[np.float64]
@@ -46,7 +46,15 @@ DEFAULT_HAND_POSE_VERSION: str = "v2"
 # hand_pose versions whose per-scene UmeTrack file is `hand_pose.json`; from v3
 # on it is `hand_pose_umetrack.json`, next to the other hand models' files.
 LEGACY_HAND_POSE_VERSIONS: frozenset[str] = frozenset({"v1", "v2"})
-DEFAULT_OBJECT_POSE_VERSION: str = "v1"
+# The test split's subjects. From hand_pose v3 and object_pose v2 on, their poses
+# are in `<hand_pose|object_pose>/<version>/test_scenes/`; the train split's are
+# in `scenes/`.
+TEST_SUBJECTS: frozenset[str] = frozenset(
+    {"AAN828", "BBL925", "BCO829", "KHE522", "NCH828", "SHE109"}
+)
+DEFAULT_OBJECT_POSE_VERSION: str = "v2"
+# object_pose versions that keep every subject in `scenes/`.
+LEGACY_OBJECT_POSE_VERSIONS: frozenset[str] = frozenset({"v1"})
 EGOCENTRIC_VIEWS: tuple[str, str] = ("headset0", "headset1")
 # The eight cameras of the back-mounted rig; a scene can lack some of them.
 EXOCENTRIC_VIEWS: tuple[str, ...] = (
@@ -71,10 +79,10 @@ LEFT_HAND: str = "left"
 RIGHT_HAND: str = "right"
 
 # SHOW3D object alias -> HOT3D object LID, for the 22 objects shared with HOT3D
-# (https://github.com/facebookresearch/hot3d). Load the CAD mesh from the HOT3D
-# release by this LID, then pose it with ``ObjectPoseFrame.pose_vertices``. The 5
-# SHOW3D-only aliases (keyboard2, cancoke, windex, clock, mug3) have no HOT3D
-# mesh.
+# (https://github.com/facebookresearch/hot3d). Each of them has a bundled mesh
+# (``load_object_mesh``) in the object frame of the poses; pose it with
+# ``ObjectPoseFrame.pose_vertices``. The 5 SHOW3D-only aliases (keyboard2,
+# cancoke, windex, clock, mug3) have no HOT3D mesh.
 HOT3D_OBJECT_LID: dict[str, int] = {
     "dumbbell": 1,
     "mouse": 3,
@@ -83,7 +91,7 @@ HOT3D_OBJECT_LID: dict[str, int] = {
     "mug2": 6,
     "balandabowl": 8,
     "vase": 11,
-    "brushholder": 15,
+    "brushholder": 16,
     "birdhousetoy": 17,
     "dinotoy": 18,
     "whiteboardmarker": 21,
@@ -98,6 +106,34 @@ HOT3D_OBJECT_LID: dict[str, int] = {
     "waffles": 30,
     "vegetables": 31,
     "aria": 33,
+}
+# SHOW3D object alias -> BOP-HOT3D object id, BOP's numbering of the same 22
+# objects (https://huggingface.co/datasets/bop-benchmark/hot3d). The bundled
+# ``<alias>.glb`` is BOP-HOT3D's ``models_eval/obj_<id:06d>.ply``, and
+# ``show3d.hot3d_models`` fetches the color model ``models/obj_<id:06d>.ply``.
+HOT3D_BOP_OBJECT_ID: dict[str, int] = {
+    "dumbbell": 22,
+    "mouse": 31,
+    "keyboard": 28,
+    "mug": 9,
+    "mug2": 8,
+    "balandabowl": 2,
+    "vase": 16,
+    "brushholder": 25,
+    "birdhousetoy": 26,
+    "dinotoy": 27,
+    "whiteboardmarker": 32,
+    "milk": 17,
+    "orangejuice": 18,
+    "mustard": 13,
+    "ranch": 15,
+    "bbq": 14,
+    "cansoup": 10,
+    "canparmesan": 11,
+    "cantomatosauce": 12,
+    "waffles": 20,
+    "vegetables": 21,
+    "aria": 23,
 }
 
 
@@ -141,11 +177,10 @@ class Show3DFrameRef:
 class ObjectPoseFrame:
     """Object 6DoF pose (world-from-object) for a single frame.
 
-    SHOW3D releases the object pose as ``rotation``/``translation_mm`` only; the
-    object mesh comes from the HOT3D release
-    (https://github.com/facebookresearch/hot3d), keyed by the object's HOT3D LID
-    (see ``HOT3D_OBJECT_LID``). Pass the HOT3D mesh vertices (object frame, mm)
-    to :meth:`pose_vertices` to get the object point cloud in world space.
+    SHOW3D releases the object pose as ``rotation``/``translation_mm`` only. Pass
+    the object's mesh vertices (object frame, mm; ``load_object_mesh`` returns
+    the bundled HOT3D mesh) to :meth:`pose_vertices` to get the object surface in
+    world space.
     """
 
     confidence: float
@@ -240,6 +275,27 @@ class Show3DFrameData:
         )
 
 
+def hand_pose_scene_dir(
+    root: str | Path, version: str, subject_id: str, scene_id: str
+) -> Path:
+    """One recording's folder in `hand_pose/<version>/`."""
+    test_split = (
+        subject_id in TEST_SUBJECTS and version not in LEGACY_HAND_POSE_VERSIONS
+    )
+    scenes = "test_scenes" if test_split else "scenes"
+    return Path(root) / "hand_pose" / version / scenes / subject_id / scene_id
+
+
+def object_pose_subject_dir(root: str | Path, version: str, subject_id: str) -> Path:
+    """One subject's folder in `object_pose/<version>/`, with one folder per
+    recording."""
+    test_split = (
+        subject_id in TEST_SUBJECTS and version not in LEGACY_OBJECT_POSE_VERSIONS
+    )
+    scenes = "test_scenes" if test_split else "scenes"
+    return Path(root) / "object_pose" / version / scenes / subject_id
+
+
 class Show3DPaths:
     """Path resolver for the public HuggingFace SHOW3D layout."""
 
@@ -274,28 +330,20 @@ class Show3DPaths:
 
     def object_pose_path(self, frame: Show3DFrameRef) -> Path:
         return (
-            self.root
-            / "object_pose"
-            / self.object_pose_version
-            / "scenes"
-            / frame.subject_id
+            object_pose_subject_dir(
+                self.root, self.object_pose_version, frame.subject_id
+            )
             / frame.scene_id
             / "object_pose.json"
         )
 
     def hand_pose_path(self, frame: Show3DFrameRef) -> Path:
-        return (
-            self.root
-            / "hand_pose"
-            / self.hand_pose_version
-            / "scenes"
-            / frame.subject_id
-            / frame.scene_id
-            / (
-                "hand_pose.json"
-                if self.hand_pose_version in LEGACY_HAND_POSE_VERSIONS
-                else "hand_pose_umetrack.json"
-            )
+        return hand_pose_scene_dir(
+            self.root, self.hand_pose_version, frame.subject_id, frame.scene_id
+        ) / (
+            "hand_pose.json"
+            if self.hand_pose_version in LEGACY_HAND_POSE_VERSIONS
+            else "hand_pose_umetrack.json"
         )
 
 
@@ -451,12 +499,28 @@ def hot3d_lid_for_scene(scene_id: str) -> int | None:
     return HOT3D_OBJECT_LID.get(object_alias_from_scene_id(scene_id))
 
 
+@dataclass(frozen=True)
+class ObjectMesh:
+    """An object's canonical triangle mesh, in the object frame, in millimeters."""
+
+    vertices_mm: FloatArray  # (N, 3)
+    faces: NDArray[np.int64]  # (F, 3) vertex indices
+    # (F, 3) RGB of each face for a color model; None for a bundled mesh.
+    face_colors: NDArray[np.uint8] | None = None
+
+
 _OBJECT_MESHES_DIR: Path = Path(__file__).resolve().parent / "assets" / "objects"
-_object_mesh_cache: dict[str, FloatArray | None] = {}
+_object_mesh_cache: dict[str, ObjectMesh | None] = {}
+# glTF accessor componentType -> dtype of triangle indices.
+_GLB_INDEX_DTYPES: dict[int, DTypeLike] = {
+    5121: np.uint8,
+    5123: np.uint16,
+    5125: np.uint32,
+}
 
 
-def _read_glb_vertices(path: Path) -> FloatArray:
-    """Read POSITION vertices (Nx3, mm) from a binary glTF (.glb). stdlib-only."""
+def _read_glb(path: Path) -> tuple[dict[str, object], bytes]:
+    """The JSON and binary chunks of a binary glTF (.glb). stdlib-only."""
     data = path.read_bytes()
     if data[:4] != b"glTF":
         raise ValueError(f"Not a binary glTF (.glb): {path}")
@@ -475,37 +539,84 @@ def _read_glb_vertices(path: Path) -> FloatArray:
             binary = chunk
     if gltf is None:
         raise ValueError(f"GLB has no JSON chunk: {path}")
+    return gltf, binary
+
+
+def _glb_accessor(
+    gltf: Mapping[str, object],
+    binary: bytes,
+    index: int,
+    dtype: DTypeLike,
+    width: int,
+    path: Path,
+) -> NDArray[np.generic]:
+    """The flat values of accessor ``index``, ``width`` per element."""
+    accessor = cast(list, gltf["accessors"])[index]
+    view = cast(list, gltf["bufferViews"])[accessor["bufferView"]]
+    element_bytes = np.zeros(width, dtype).nbytes
+    stride = view.get("byteStride", element_bytes)
+    if stride != element_bytes:
+        raise ValueError(
+            f"GLB buffer view has byteStride {stride}, not {element_bytes}: {path}"
+        )
+    start = view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
+    return np.frombuffer(binary, dtype, accessor["count"] * width, start)
+
+
+def _read_glb_mesh(path: Path) -> ObjectMesh:
+    """The triangles of a .glb whose positions are in mm, all primitives merged.
+
+    Node transforms are not applied; the bundled files have none.
+    """
+    gltf, binary = _read_glb(path)
     accessors = cast(list, gltf["accessors"])
-    views = cast(list, gltf["bufferViews"])
-    parts: list[FloatArray] = []
+    vertex_parts: list[FloatArray] = []
+    face_parts: list[NDArray[np.int64]] = []
+    num_vertices = 0
     for mesh in cast(list, gltf.get("meshes", [])):
         for prim in cast(list, mesh["primitives"]):
-            acc = accessors[prim["attributes"]["POSITION"]]
-            view = views[acc["bufferView"]]
-            start = view.get("byteOffset", 0) + acc.get("byteOffset", 0)
-            count = acc["count"]
-            parts.append(
-                np.frombuffer(binary, np.float32, count * 3, start)
-                .reshape(count, 3)
-                .astype(np.float64)
-            )
-    return np.concatenate(parts, 0)
+            if prim.get("mode", 4) != 4:
+                raise ValueError(f"GLB primitive is not a triangle list: {path}")
+            position = prim["attributes"]["POSITION"]
+            vertices = _glb_accessor(gltf, binary, position, np.float32, 3, path)
+            index_dtype = _GLB_INDEX_DTYPES[accessors[prim["indices"]]["componentType"]]
+            indices = _glb_accessor(gltf, binary, prim["indices"], index_dtype, 1, path)
+            vertex_parts.append(vertices.reshape(-1, 3).astype(np.float64))
+            face_parts.append(indices.reshape(-1, 3).astype(np.int64) + num_vertices)
+            num_vertices += len(vertices) // 3
+    return ObjectMesh(
+        vertices_mm=np.concatenate(vertex_parts, 0),
+        faces=np.concatenate(face_parts, 0),
+    )
+
+
+def load_object_mesh_with_faces(object_alias: str) -> ObjectMesh | None:
+    """The bundled canonical mesh of an object alias, or None for an alias
+    without one.
+
+    Meshes are bundled under ``assets/objects/<alias>.glb`` for the 22 objects of
+    ``HOT3D_OBJECT_LID``: BOP-HOT3D's ``models_eval`` models, in the object frame
+    of the released poses, in mm, with no color. ``show3d.hot3d_models`` fetches
+    the full models with their textures.
+    """
+    if object_alias not in _object_mesh_cache:
+        path = _OBJECT_MESHES_DIR / f"{object_alias}.glb"
+        _object_mesh_cache[object_alias] = (
+            _read_glb_mesh(path) if path.exists() else None
+        )
+    return _object_mesh_cache[object_alias]
 
 
 def load_object_mesh(object_alias: str) -> FloatArray | None:
     """Canonical object-mesh vertices (object frame, mm) for an alias, or None.
 
-    Meshes are bundled under ``assets/objects/<alias>.glb``. Pose them with
-    ``ObjectPoseFrame.pose_vertices`` and the released per-frame ``R``/``t`` to
-    reconstruct the object point cloud in world space -- no HOT3D checkout and no
-    multi-gigabyte per-frame vertices required.
+    Pose them with ``ObjectPoseFrame.pose_vertices`` and the released per-frame
+    ``R``/``t`` to reconstruct the object surface in world space -- no HOT3D
+    checkout and no multi-gigabyte per-frame vertices required.
+    :func:`load_object_mesh_with_faces` also returns the triangles.
     """
-    if object_alias not in _object_mesh_cache:
-        path = _OBJECT_MESHES_DIR / f"{object_alias}.glb"
-        _object_mesh_cache[object_alias] = (
-            _read_glb_vertices(path) if path.exists() else None
-        )
-    return _object_mesh_cache[object_alias]
+    mesh = load_object_mesh_with_faces(object_alias)
+    return None if mesh is None else mesh.vertices_mm
 
 
 def default_object_mesh_provider() -> Callable[[str], FloatArray | None]:
@@ -803,6 +914,66 @@ def load_object_pose_frame(
         rotation=rotation,
         translation_mm=translation,
     )
+
+
+def object_pose_frame_indices(
+    path: str | Path,
+    *,
+    min_confidence: float | None = None,
+    frames: Container[int] | None = None,
+    cache: dict[Path, Mapping[str, object]] | None = None,
+) -> list[int]:
+    """The frames of an object_pose file, in frame order: every frame with an
+    entry, or with ``min_confidence``, the frames whose entry has a pose above
+    it. ``frames`` limits the result to those frames, and only their poses are
+    read. Empty when the file is missing.
+
+    The file's keys are its frame grid. A v1 file has an entry on every video
+    frame. A v2 file has one on every other video frame, from frame 0 or frame 1
+    (in a few files the grid shifts by one frame at one or more points), or on every
+    video frame.
+    """
+    pose_path = Path(path)
+    if not pose_path.exists():
+        return []
+    cache = {} if cache is None else cache
+    keys = sorted(int(key) for key in _load_json_mapping(pose_path, cache))
+    if frames is not None:
+        keys = [frame_index for frame_index in keys if frame_index in frames]
+    if min_confidence is None:
+        return keys
+    posed: list[int] = []
+    for frame_index in keys:
+        pose = load_object_pose_frame(pose_path, frame_index, cache=cache)
+        if pose is not None and pose.confidence > min_confidence:
+            posed.append(frame_index)
+    return posed
+
+
+def posed_frames(
+    root: str | Path,
+    subject_id: str,
+    scene_id: str,
+    *,
+    object_pose_version: str = DEFAULT_OBJECT_POSE_VERSION,
+    min_confidence: float = 0.0,
+) -> list[Show3DFrameRef]:
+    """The frames of a recording whose object_pose entry has a pose above
+    ``min_confidence``, in frame order; empty when the recording has no
+    object_pose file in that version.
+
+    The frames come from the file's keys (:func:`object_pose_frame_indices`), so
+    they follow each file's own frame grid, which a fixed stride from frame 0
+    can miss entirely.
+    """
+    paths = Show3DPaths(root, object_pose_version=object_pose_version)
+    path = paths.object_pose_path(Show3DFrameRef(subject_id, scene_id, 0))
+    return [
+        Show3DFrameRef(subject_id, scene_id, frame_index)
+        for frame_index in object_pose_frame_indices(
+            path, min_confidence=min_confidence
+        )
+    ]
 
 
 def load_hand_pose_frame(

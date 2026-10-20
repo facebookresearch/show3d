@@ -13,11 +13,15 @@ import numpy as np
 
 from ..dataset import (
     DEFAULT_VIDEO_FPS,
+    HOT3D_OBJECT_LID,
     load_camera_calibration,
+    load_object_mesh_with_faces,
     ObjectPoseFrame,
+    posed_frames,
     sampled_frame_indices,
     Show3DDataset,
     Show3DFrameRef,
+    Show3DPaths,
     write_frame_manifest_jsonl,
 )
 
@@ -78,6 +82,42 @@ class Show3DDatasetTest(unittest.TestCase):
             self.assertEqual(item.left_hand.confidence, 0.95)
             self.assertEqual(item.right_hand.confidence, 0.0)
 
+    def test_test_split_poses_come_from_test_scenes(self) -> None:
+        # A missing pose file reads as no pose, so a wrong folder would silently
+        # drop every test-split hand or object pose.
+        paths = Show3DPaths("/show3d", hand_pose_version="v3", object_pose_version="v2")
+        train = Show3DFrameRef(
+            subject_id="S001", scene_id="mug_grab_a1b2", frame_index=0
+        )
+        test = Show3DFrameRef(
+            subject_id="AAN828", scene_id="mug_grab_c3d4", frame_index=0
+        )
+
+        self.assertEqual(
+            paths.hand_pose_path(train),
+            Path(
+                "/show3d/hand_pose/v3/scenes/S001/mug_grab_a1b2/hand_pose_umetrack.json"
+            ),
+        )
+        self.assertEqual(
+            paths.hand_pose_path(test),
+            Path(
+                "/show3d/hand_pose/v3/test_scenes/AAN828/mug_grab_c3d4/hand_pose_umetrack.json"
+            ),
+        )
+        self.assertEqual(
+            paths.object_pose_path(test),
+            Path(
+                "/show3d/object_pose/v2/test_scenes/AAN828/mug_grab_c3d4/object_pose.json"
+            ),
+        )
+        # The challenge's label builder reads organizer copies of hand_pose v2,
+        # which keep every subject in `scenes/`.
+        self.assertEqual(
+            Show3DPaths("/show3d", hand_pose_version="v2").hand_pose_path(test),
+            Path("/show3d/hand_pose/v2/scenes/AAN828/mug_grab_c3d4/hand_pose.json"),
+        )
+
     def test_rig_calibration_has_a_static_pose_on_every_frame(self) -> None:
         transform = [
             [0.0, -1.0, 0.0, 10.0],
@@ -121,6 +161,57 @@ class Show3DDatasetTest(unittest.TestCase):
         np.testing.assert_allclose(
             world, np.asarray([[100.0, 1.0, 0.0], [98.0, 0.0, 0.0]])
         )
+
+    def test_posed_frames_come_from_the_file_keys(self) -> None:
+        # object_pose v2 entries: odd frames, one without a pose, one at 0.45.
+        rotation = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        entries = {
+            1: {"R": rotation, "t": [[10.0], [0.0], [0.0]], "confidence": 0.9},
+            3: {"R": [], "t": [], "confidence": 0.0},
+            5: {"R": rotation, "t": [[11.0], [0.0], [0.0]], "confidence": 0.45},
+            11: {"R": rotation, "t": [[12.0], [0.0], [0.0]], "confidence": 0.7},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pose_dir = root / "object_pose" / "v2" / "scenes" / "S001" / "mug_grab_a1b2"
+            pose_dir.mkdir(parents=True)
+            (pose_dir / "object_pose.json").write_text(
+                json.dumps(
+                    {
+                        str(index): {"index": index, "missing_cameras": [], **entry}
+                        for index, entry in entries.items()
+                    }
+                )
+            )
+
+            def posed(min_confidence: float) -> list[int]:
+                frames = posed_frames(
+                    root,
+                    "S001",
+                    "mug_grab_a1b2",
+                    object_pose_version="v2",
+                    min_confidence=min_confidence,
+                )
+                return [frame.frame_index for frame in frames]
+
+            self.assertEqual(posed(0.0), [1, 5, 11])
+            self.assertEqual(posed(0.5), [1, 11])
+
+    def test_every_hot3d_object_has_a_bundled_mesh_in_mm(self) -> None:
+        for alias in HOT3D_OBJECT_LID:
+            with self.subTest(alias=alias):
+                mesh = load_object_mesh_with_faces(alias)
+                self.assertIsNotNone(mesh)
+                assert mesh is not None
+                vertices, faces = mesh.vertices_mm, mesh.faces
+                # Every vertex is a corner of a triangle.
+                np.testing.assert_array_equal(
+                    np.unique(faces), np.arange(len(vertices))
+                )
+                # The longest side runs from 82 mm (cansoup) to 429 mm (keyboard);
+                # a mesh in meters would be 1000 times smaller.
+                extent = vertices.max(axis=0) - vertices.min(axis=0)
+                self.assertTrue(50.0 < extent.max() < 1000.0, extent)
 
     def test_single_view_selection_populates_one_view(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -402,7 +493,7 @@ class Show3DDatasetTest(unittest.TestCase):
         (metadata_dir / "frame_info.json").write_text("{}")
 
         object_pose_dir = (
-            root / "object_pose" / "v1" / "scenes" / frame.subject_id / frame.scene_id
+            root / "object_pose" / "v2" / "scenes" / frame.subject_id / frame.scene_id
         )
         object_pose_dir.mkdir(parents=True)
         with (object_pose_dir / "object_pose.json").open("w") as f:

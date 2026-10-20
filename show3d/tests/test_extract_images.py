@@ -102,7 +102,7 @@ class ExtractImagesTest(unittest.TestCase):
             # Posed scene: has object_pose.json.
             posed = root / "scenes" / "S001" / "mug_grab_aaaa"
             self._write_video(posed / "headset0.mp4", num_frames=13, fps=60)
-            op_dir = root / "object_pose" / "v1" / "scenes" / "S001" / "mug_grab_aaaa"
+            op_dir = root / "object_pose" / "v2" / "scenes" / "S001" / "mug_grab_aaaa"
             op_dir.mkdir(parents=True)
             (op_dir / "object_pose.json").write_text("{}")
             # Unposed scene: no object_pose.json -> skipped.
@@ -122,6 +122,44 @@ class ExtractImagesTest(unittest.TestCase):
             self.assertEqual(info["num_recordings"], 1)
             scenes = {row["scene_id"] for row in self._read_index(out)}
             self.assertEqual(scenes, {"mug_grab_aaaa"})
+
+    def test_posed_only_samples_the_odd_v2_label_grid(self) -> None:
+        # object_pose v2 entries on odd frames only; frame 13 has no pose.
+        rotation = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        entries = {
+            str(index): {
+                "index": index,
+                "missing_cameras": [],
+                "R": [] if index == 13 else rotation,
+                "t": [] if index == 13 else [[0.0], [0.0], [float(index)]],
+                "confidence": 0.0 if index == 13 else 0.9,
+            }
+            for index in range(1, 26, 2)
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "data"
+            scene = root / "scenes" / "S001" / "mug_grab_aaaa"
+            self._write_video(scene / "headset0.mp4", num_frames=26, fps=60)
+            pose_dir = root / "object_pose" / "v2" / "scenes" / "S001" / "mug_grab_aaaa"
+            pose_dir.mkdir(parents=True)
+            (pose_dir / "object_pose.json").write_text(json.dumps(entries))
+
+            out = Path(td) / "frames"
+            run_extraction(
+                root,
+                out,
+                fps=10,
+                views=("headset0",),
+                posed_only=True,
+                object_pose_version="v2",
+                workers=1,
+            )
+
+            # Every 6th frame of the file's grid 1, 3, ..., 25, minus frame 13.
+            frames = sorted(
+                cast(int, row["frame_index"]) for row in self._read_index(out)
+            )
+            self.assertEqual(frames, [1, 7, 19, 25])
 
     def test_manifest_selects_exact_scenes(self) -> None:
         with tempfile.TemporaryDirectory() as td:

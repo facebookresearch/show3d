@@ -24,6 +24,15 @@ Sampling keeps every k-th frame, so ``--fps`` must be a whole number that divide
 the 60 fps source: 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, or 60. It is required
 and rejects any other value.
 
+Frames are counted from frame 0. With ``--posed-only``, they come from the frame
+grid of the recording's object_pose file instead: the tool walks the file's
+frames and keeps one once it is k frames past the last one kept, then drops those
+without a pose above 0.5. A v1 file covers every frame from 0, so this is the
+same every k-th frame. A v2 file has an entry on every other frame, from frame 0
+or frame 1, or on every frame. On an every-other-frame grid an odd k becomes
+k + 1, so the rate rounds down to the grid: ``--fps 20`` gives 15 fps there and
+``--fps 12`` gives 10. A v2 run with such an fps prints a one-line note.
+
     python -m show3d.extract_images --root /path/to/show3d --out frames/ --fps 10
     python -m show3d.extract_images --root /path/to/show3d --out frames/ --fps 5 \\
         --views headset0 --quality 80 --workers 16 --posed-only
@@ -54,7 +63,7 @@ from .dataset import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_OBJECT_POSE_VERSION,
     EGOCENTRIC_VIEWS,
-    load_object_pose_frame,
+    object_pose_frame_indices,
     sampled_frame_indices,
     Show3DFrameRef,
     Show3DPaths,
@@ -133,20 +142,29 @@ def scenes_from_manifest(manifest_path: str | Path) -> list[tuple[str, str]]:
     return scenes
 
 
-def _posed_indices(
-    object_pose_path: Path,
-    frame_indices: set[int],
-    *,
-    confidence_threshold: float,
-    cache: dict[Path, Mapping[str, object]],
-) -> set[int]:
-    if not object_pose_path.exists():
-        return set()
+def _posed_only_grid_note(fps: int, source_fps: float) -> str | None:
+    """The rate that ``--posed-only`` keeps on an every-other-frame label grid,
+    when the stride for ``fps`` is odd and so grows by one frame there."""
+    stride = max(1, round(source_fps / fps))
+    if stride % 2 == 0:
+        return None
+    return (
+        f"Note: where an object_pose file labels every other frame, --posed-only "
+        f"--fps {fps} keeps one frame in {stride + 1} ({source_fps / (stride + 1):g} fps)."
+    )
+
+
+def _label_grid_indices(frames: list[int], stride: int, num_frames: int) -> set[int]:
+    """Walk the object_pose file's sorted frames and keep one once it is at least
+    ``stride`` frames past the last kept one."""
     kept: set[int] = set()
-    for frame_index in frame_indices:
-        pose = load_object_pose_frame(object_pose_path, frame_index, cache=cache)
-        if pose is not None and pose.confidence > confidence_threshold:
+    last: int | None = None
+    for frame_index in frames:
+        if frame_index >= num_frames:
+            break
+        if last is None or frame_index - last >= stride:
             kept.add(frame_index)
+            last = frame_index
     return kept
 
 
@@ -158,15 +176,22 @@ def _wanted_indices(
     pose_cache: dict[Path, Mapping[str, object]],
 ) -> set[int]:
     video_fps = capture.get(cv2.CAP_PROP_FPS) or DEFAULT_SOURCE_FPS
-    wanted = set(sampled_frame_indices(num_frames, config.fps, video_fps=video_fps))
-    if config.posed_only and wanted:
-        wanted = _posed_indices(
-            object_pose_path,
-            wanted,
-            confidence_threshold=DEFAULT_CONFIDENCE_THRESHOLD,
-            cache=pose_cache,
-        )
-    return wanted
+    if not config.posed_only:
+        return set(sampled_frame_indices(num_frames, config.fps, video_fps=video_fps))
+    # The file's own frame grid: a v2 file can label odd frames only, where a
+    # stride from frame 0 finds none. On a v1 file it is the stride from frame 0.
+    grid = _label_grid_indices(
+        object_pose_frame_indices(object_pose_path, cache=pose_cache),
+        max(1, round(video_fps / config.fps)),
+        num_frames,
+    )
+    posed = object_pose_frame_indices(
+        object_pose_path,
+        min_confidence=DEFAULT_CONFIDENCE_THRESHOLD,
+        frames=grid,
+        cache=pose_cache,
+    )
+    return set(posed)
 
 
 def _write_sampled(
@@ -350,6 +375,10 @@ def run_extraction(
         posed_only=posed_only,
         object_pose_version=object_pose_version,
     )
+    # v1 labels every frame, so only a later release can round the rate.
+    note = _posed_only_grid_note(fps, source_fps)
+    if verbose and posed_only and object_pose_version != "v1" and note is not None:
+        print(note)
     args = [(str(root_path), str(out_path), s, sc, config) for (s, sc) in scenes]
     rows = _run_scenes(args, workers, verbose)
 
@@ -426,7 +455,8 @@ def main() -> None:
     parser.add_argument(
         "--posed-only",
         action="store_true",
-        help="skip frames without a confident object pose (needs object_pose/)",
+        help="keep only frames with a confident object pose, sampled on the frame "
+        "grid of each recording's object_pose file (needs object_pose/)",
     )
     parser.add_argument(
         "--require-object-pose",

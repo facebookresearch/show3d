@@ -13,7 +13,12 @@ from pathlib import Path
 
 import numpy as np
 
-from .dataset import NUM_HAND_LANDMARKS, Show3DFrameRef
+from .dataset import (
+    DEFAULT_OBJECT_POSE_VERSION,
+    NUM_HAND_LANDMARKS,
+    object_pose_subject_dir,
+    Show3DFrameRef,
+)
 
 
 def build_synthetic_scene(root: Path, *, num_frames: int = 6) -> Path:
@@ -70,7 +75,8 @@ def build_synthetic_scene(root: Path, *, num_frames: int = 6) -> Path:
         for i in range(num_frames)
     }
     _write_json(
-        root / "object_pose" / "v1" / "scenes" / subject_id / scene_id,
+        object_pose_subject_dir(root, DEFAULT_OBJECT_POSE_VERSION, subject_id)
+        / scene_id,
         "object_pose.json",
         object_pose,
     )

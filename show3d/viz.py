@@ -14,7 +14,8 @@ Two renders of one frame, each writing a PNG:
 
 :func:`run_visualization` picks a suitable frame from a frame manifest and
 dispatches to one of them. :func:`render_hand_meshes` draws the posed hand meshes
-of one hand model (:mod:`show3d.hand_mesh`) on a frame or a frame range.
+of one hand model (:mod:`show3d.hand_mesh`) on a frame or a frame range, and
+:func:`render_object_mesh` draws a scene's posed object mesh on a frame.
 Projection lives in :mod:`show3d.camera`; the CLI is :mod:`show3d.demo_viz`.
 Needs matplotlib.
 """
@@ -37,14 +38,21 @@ from .dataset import (
     CameraCalibration,
     DEFAULT_CONFIDENCE_THRESHOLD,
     default_object_mesh_provider,
+    DEFAULT_OBJECT_POSE_VERSION,
     DEFAULT_VIDEO_FPS,
     EGOCENTRIC_VIEWS,
     EXOCENTRIC_VIEWS,
     FloatArray,
     HandPoseFrame,
+    HOT3D_OBJECT_LID,
     LEFT_HAND,
     load_camera_calibration,
+    load_object_mesh_with_faces,
+    load_object_pose_frame,
     object_alias_from_scene_id,
+    object_pose_frame_indices,
+    ObjectMesh,
+    ObjectPoseFrame,
     RIGHT_HAND,
     seek_frame,
     Show3DDataset,
@@ -59,6 +67,7 @@ from .hand_mesh import (
     LEFT_SLOT,
     RIGHT_SLOT,
 )
+from .hot3d_models import color_model_path, load_color_mesh
 
 MODES: tuple[str, ...] = ("overlay", "geometry")
 
@@ -98,6 +107,15 @@ MESH_COLORS: tuple[tuple[int, int, int], tuple[int, int, int]] = (
     (235, 104, 52),
     (42, 184, 214),
 )
+# Object mesh RGB: the fill of a mesh without color, and the outline drawn
+# around every object mesh, green to read on the magenta fill, on the textures
+# and on the gray headset frames.
+OBJECT_FILL_COLOR: tuple[int, int, int] = (255, 0, 255)
+OBJECT_OUTLINE_COLOR: tuple[int, int, int] = (0, 255, 0)
+# Shading of a mesh face is ambient + (1 - ambient) * cos(angle to the camera):
+# strong for the flat-colored meshes, light for the textured color models.
+_FLAT_AMBIENT: float = 0.3
+_TEXTURE_AMBIENT: float = 0.7
 
 
 def _hex_color(rgb: tuple[int, int, int]) -> str:
@@ -219,22 +237,82 @@ def draw_hand_meshes(
     occludes the other. A triangle with a vertex behind the camera, or with a
     vertex that projects to a non-finite pixel, is skipped.
     """
+    image, _covered = _paint_meshes(
+        image_rgb,
+        [(mesh.vertices_world_mm, mesh.faces, rgb) for mesh, rgb in meshes],
+        calibration,
+        alpha,
+        ambient=_FLAT_AMBIENT,
+    )
+    return image
+
+
+def draw_object_mesh(
+    image_rgb: NDArray[np.uint8],
+    mesh: ObjectMesh,
+    pose: ObjectPoseFrame,
+    calibration: CameraCalibration,
+    *,
+    alpha: float = 0.8,
+) -> NDArray[np.uint8]:
+    """Draw the object mesh, posed by ``pose``, on a copy of the frame as shaded
+    triangles blended at ``alpha``, then outline the silhouette's outer contour.
+
+    A color model (``mesh.face_colors``, :func:`show3d.hot3d_models.load_color_mesh`)
+    is painted in its colors, lightly shaded; a bundled mesh in
+    ``OBJECT_FILL_COLOR``. Triangles are skipped as in :func:`draw_hand_meshes`.
+    """
+    image, covered = _paint_meshes(
+        image_rgb,
+        [
+            (
+                pose.pose_vertices(mesh.vertices_mm),
+                mesh.faces,
+                OBJECT_FILL_COLOR if mesh.face_colors is None else mesh.face_colors,
+            )
+        ],
+        calibration,
+        alpha,
+        ambient=_FLAT_AMBIENT if mesh.face_colors is None else _TEXTURE_AMBIENT,
+    )
+    # OpenCV 3 returns (image, contours, hierarchy), OpenCV 4 drops the image.
+    contours = cv2.findContours(
+        covered.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )[-2]
+    cv2.drawContours(image, contours, -1, OBJECT_OUTLINE_COLOR, 2, cv2.LINE_AA)
+    return image
+
+
+def _paint_meshes(
+    image_rgb: NDArray[np.uint8],
+    meshes: Sequence[
+        tuple[FloatArray, NDArray[np.int64], tuple[int, int, int] | NDArray[np.uint8]]
+    ],
+    calibration: CameraCalibration,
+    alpha: float,
+    *,
+    ambient: float,
+) -> tuple[NDArray[np.uint8], NDArray[np.bool_]]:
+    """Paint ``(vertices_world_mm, faces, rgb)`` meshes as in
+    :func:`draw_hand_meshes`, where ``rgb`` is one color or an (F, 3) color per
+    face; return the image and the mask of covered pixels."""
     t_world_from_camera = calibration.t_world_from_camera
     if t_world_from_camera is None:
         raise ValueError("frame has no valid t_world_from_camera")
     depths: list[FloatArray] = []
     points: list[NDArray[np.int32]] = []
     colors: list[FloatArray] = []
-    for mesh, rgb in meshes:
-        triangles = camera.world_to_camera(mesh.vertices_world_mm, t_world_from_camera)[
-            mesh.faces
+    for vertices_world_mm, faces, rgb in meshes:
+        triangles = camera.world_to_camera(vertices_world_mm, t_world_from_camera)[
+            faces
         ]
+        face_rgb = np.broadcast_to(np.asarray(rgb, np.float64), (len(faces), 3))
         front = (triangles[:, :, 2] > 0.0).all(axis=1)
-        triangles = triangles[front]
-        uv, _valid = camera.project_to_image(mesh.vertices_world_mm, calibration)
-        uv = uv[mesh.faces[front]]
+        triangles, face_rgb = triangles[front], face_rgb[front]
+        uv, _valid = camera.project_to_image(vertices_world_mm, calibration)
+        uv = uv[faces[front]]
         finite = np.isfinite(uv).all(axis=(1, 2))
-        triangles, uv = triangles[finite], uv[finite]
+        triangles, uv, face_rgb = triangles[finite], uv[finite], face_rgb[finite]
         center = np.array([calibration.cx, calibration.cy])
         offset = uv - center
         distance = np.linalg.norm(offset, axis=-1, keepdims=True)
@@ -253,10 +331,10 @@ def draw_hand_meshes(
         )
         depths.append(centers[:, 2])
         points.append(np.round(uv * (1 << _SUBPIXEL_BITS)).astype(np.int32))
-        colors.append((0.3 + 0.7 * cosine)[:, None] * np.asarray(rgb, np.float64))
+        colors.append((ambient + (1.0 - ambient) * cosine)[:, None] * face_rgb)
     out = image_rgb.copy()
     if not depths:
-        return out
+        return out, np.zeros(image_rgb.shape[:2], dtype=np.bool_)
     depth = np.concatenate(depths)
     triangle_points = np.concatenate(points)
     triangle_colors = np.concatenate(colors)
@@ -274,7 +352,7 @@ def draw_hand_meshes(
     out[mask] = (alpha * painted[mask] + (1.0 - alpha) * image_rgb[mask]).astype(
         np.uint8
     )
-    return out
+    return out, mask
 
 
 # ----------------------------------------------------------------------------
@@ -591,6 +669,7 @@ def run_visualization(
     *,
     mode: str = "geometry",
     view: str = "headset0",
+    object_pose_version: str = DEFAULT_OBJECT_POSE_VERSION,
     verbose: bool = False,
 ) -> Path:
     """Pick a suitable frame from the manifest and render ``mode`` to ``out_path``."""
@@ -603,7 +682,9 @@ def run_visualization(
             + (_overlay_view_names(view) if mode == "overlay" else ())
         )
     )
-    dataset = Show3DDataset.from_manifest_jsonl(root, manifest_path, views=views)
+    dataset = Show3DDataset.from_manifest_jsonl(
+        root, manifest_path, object_pose_version=object_pose_version, views=views
+    )
     frame_data = _pick_frame(dataset, mode, view)
     if frame_data is None:
         if not dataset.frames:
@@ -764,4 +845,116 @@ def render_hand_meshes(
         raise ValueError(f"could not read frame {start} of {video_path}")
     if verbose:
         print(f"[{model}] {subject}/{scene} {view} frames {start}+{written} -> {out}")
+    return out
+
+
+def _posed_frame_index(
+    frames: list[int], frame_index: int | None, where: str, min_confidence: float
+) -> int:
+    """``frame_index``, or the first of the posed ``frames``; raise when that
+    frame is not among them."""
+    if not frames:
+        raise ValueError(f"{where} has no object pose above {min_confidence}")
+    if frame_index is None:
+        return frames[0]
+    if frame_index not in frames:
+        raise ValueError(
+            f"frame {frame_index} of {where} has no object pose above "
+            f"{min_confidence}; its {len(frames)} posed frames run from {frames[0]} "
+            f"to {frames[-1]}"
+        )
+    return frame_index
+
+
+def _object_pose_file(paths: Show3DPaths, subject: str, scene: str, view: str) -> Path:
+    """The scene's object_pose file; raise when the view is not one camera, the
+    object has no HOT3D mesh, or the camera's video or the file is missing."""
+    if view not in CAMERA_VIEWS:
+        raise ValueError(
+            f"object meshes draw on one camera of {CAMERA_VIEWS}, got {view!r}"
+        )
+    alias = object_alias_from_scene_id(scene)
+    if alias not in HOT3D_OBJECT_LID:
+        raise ValueError(
+            f"{alias!r} has no HOT3D mesh; the meshes cover {sorted(HOT3D_OBJECT_LID)}"
+        )
+    first = Show3DFrameRef(subject, scene, 0)
+    for what, path in (
+        (f"{view} camera", paths.video_path(first, view)),
+        (
+            f"object_pose {paths.object_pose_version} file",
+            paths.object_pose_path(first),
+        ),
+    ):
+        if not path.exists():
+            raise ValueError(f"{subject}/{scene} has no {what}: {path} is missing")
+    return paths.object_pose_path(first)
+
+
+def render_object_mesh(
+    root: str | Path,
+    subject: str,
+    scene: str,
+    out_path: str | Path,
+    *,
+    view: str = "headset0",
+    frame_index: int | None = None,
+    object_pose_version: str = DEFAULT_OBJECT_POSE_VERSION,
+    min_confidence: float = 0.0,
+    hot3d_models_dir: str | Path | None = None,
+    verbose: bool = False,
+) -> Path:
+    """Draw the scene's object mesh, posed by its object pose, on one frame of
+    ``view`` (:func:`draw_object_mesh`), and write the frame as an image.
+
+    The mesh is the object's color model when :mod:`show3d.hot3d_models` has
+    fetched it into ``hot3d_models_dir`` (default: its cache folder), else the
+    bundled mesh. With no ``frame_index``, use the scene's first frame with an
+    object pose above ``min_confidence``.
+    """
+    pose_path = _object_pose_file(
+        Show3DPaths(root, object_pose_version=object_pose_version),
+        subject,
+        scene,
+        view,
+    )
+    cache: dict[Path, Mapping[str, object]] = {}
+    frame = Show3DFrameRef(
+        subject,
+        scene,
+        _posed_frame_index(
+            object_pose_frame_indices(
+                pose_path, min_confidence=min_confidence, cache=cache
+            ),
+            frame_index,
+            str(pose_path),
+            min_confidence,
+        ),
+    )
+    pose = load_object_pose_frame(pose_path, frame.frame_index, cache=cache)
+    frame_data = Show3DDataset(
+        root, [frame], load_poses=False, views=(view,), decode_images=True
+    )[0]
+    _video_path, calibration = _overlay_view(frame_data, view)
+    image = frame_data.views[view].image
+    alias = object_alias_from_scene_id(scene)
+    color_mesh = load_color_mesh(alias, hot3d_models_dir)
+    mesh = color_mesh if color_mesh is not None else load_object_mesh_with_faces(alias)
+    if image is None or pose is None or mesh is None:
+        raise ValueError(f"no image, object pose or mesh for {frame.sample_id}")
+    drawn = draw_object_mesh(image, mesh, pose, calibration)
+    out = Path(out_path)
+    if not cv2.imwrite(str(out), cv2.cvtColor(drawn, cv2.COLOR_RGB2BGR)):
+        raise OSError(f"could not write {out}")
+    if verbose:
+        kind = "color model" if color_mesh is not None else "bundled mesh"
+        print(f"[{alias}, {kind}] {frame.sample_id} {view} -> {out}")
+        if color_mesh is None:
+            fetch = "python -m show3d.hot3d_models"
+            if hot3d_models_dir is not None:
+                fetch += f" --cache-dir {hot3d_models_dir}"
+            print(
+                f"  No color model at {color_model_path(alias, hot3d_models_dir)}; "
+                f"`{fetch}` fetches it."
+            )
     return out

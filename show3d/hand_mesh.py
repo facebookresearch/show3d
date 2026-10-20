@@ -39,7 +39,12 @@ from typing import cast, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
-from .dataset import ACCEPT_CONFIDENCE_THRESHOLD, FloatArray, LEGACY_HAND_POSE_VERSIONS
+from .dataset import (
+    ACCEPT_CONFIDENCE_THRESHOLD,
+    FloatArray,
+    hand_pose_scene_dir,
+    LEGACY_HAND_POSE_VERSIONS,
+)
 
 HAND_MODELS: tuple[str, ...] = ("umetrack", "mano", "mhr")
 # MANO and MHR ship from hand_pose v3 on.
@@ -99,14 +104,9 @@ class HandMeshScene:
         if model not in HAND_MODELS:
             raise ValueError(f"model must be one of {HAND_MODELS}, got {model!r}")
         hand_pose_dir = Path(root) / "hand_pose"
-        scene_path = (
-            hand_pose_dir
-            / version
-            / "scenes"
-            / subject
-            / scene
-            / _scene_file_name(version, model)
-        )
+        scene_path = hand_pose_scene_dir(
+            root, version, subject, scene
+        ) / _scene_file_name(version, model)
         with scene_path.open() as f:
             payload = cast(dict[str, object], json.load(f))
         # The UmeTrack file maps frame keys to frames; MANO and MHR files nest
