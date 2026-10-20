@@ -2,6 +2,8 @@
 
 ## 2026-10-19
 
+- The README is shorter; `show3d/README.md` holds the module layout, the
+  frame and camera details and the full options.
 - The README's data layout lists `interaction_field/v1`, the hand-to-object
   vectors released on Hugging Face on October 19, 2026. They differ from the
   labels of the ECCV 2026 Interaction Field Estimation Challenge.
